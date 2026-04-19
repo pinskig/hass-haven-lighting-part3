@@ -164,9 +164,25 @@ class Credentials:
             
         try:
             response = requests.request(method, url, timeout=timeout, **kwargs)
+
+            rate_limit = response.headers.get("X-RateLimit-Limit")
+            rate_remaining = response.headers.get("X-RateLimit-Remaining")
+            retry_after = response.headers.get("Retry-After")
+            if rate_limit or rate_remaining or retry_after:
+                logger.debug(
+                    "Rate-limit headers for %s %s -> limit=%s remaining=%s retry_after=%s",
+                    method,
+                    path,
+                    rate_limit,
+                    rate_remaining,
+                    retry_after,
+                )
             
             if response.status_code == 401:
                 raise AuthenticationError("Received 401 Unauthorized response")
+
+            if response.status_code == 429:
+                raise ApiError("Received 429 Too Many Requests response")
             
             response.raise_for_status()
             

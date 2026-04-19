@@ -9,6 +9,8 @@ logger = logging.getLogger(__name__)
 
 class Location:
     MIN_CAPABILITY_LEVEL: ClassVar[int] = 0
+    MIN_POLL_INTERVAL: ClassVar[int] = 5
+    MAX_POLL_INTERVAL: ClassVar[int] = 80
     
     def __init__(self, credentials: Credentials, location_id: int, data: Optional[Dict[str, Any]] = None) -> None:
         self._credentials = credentials
@@ -20,6 +22,7 @@ class Location:
         ) if data else None
         self._lights: Dict[int, Light] = {}
         self._last_refresh = 0
+        self._poll_interval = self.MIN_POLL_INTERVAL
         self._real_location_name = None # Store the real name (e.g., "Crescenti Oasis")
         
     @property
@@ -41,8 +44,12 @@ class Location:
         return locations
 
     def refresh_devices(self, force: bool = False) -> None:
-        if not force and (time.time() - self._last_refresh < 5):
+        if not force and (time.time() - self._last_refresh < self._poll_interval):
             return
+
+        has_changes = False
+        had_error = False
+        seen_light_ids: set[int] = set()
 
         # 1. Fetch Individual Zones
         try:
@@ -58,9 +65,11 @@ class Location:
                     self._real_location_name = item["locationName"]
                     
                 if item.get("isZone"):
-                    self._add_or_update_light(item, is_group=False)
+                    seen_light_ids.add(int(item["id"]))
+                    has_changes = self._add_or_update_light(item, is_group=False) or has_changes
         except Exception as e:
             logger.error("Failed to refresh zones: %s", str(e))
+            had_error = True
 
         # 2. Fetch Groups
         try:
@@ -80,27 +89,47 @@ class Location:
                     "isZone": False,
                     "type": "Group"
                 }
-                self._add_or_update_light(group_data, is_group=True)
+                seen_light_ids.add(int(group_data["id"]))
+                has_changes = self._add_or_update_light(group_data, is_group=True) or has_changes
         except Exception as e:
             logger.error("Failed to refresh groups: %s", str(e))
+            had_error = True
+
+        stale_light_ids = set(self._lights.keys()) - seen_light_ids
+        for stale_light_id in stale_light_ids:
+            del self._lights[stale_light_id]
+            has_changes = True
+
+        if had_error:
+            self._poll_interval = min(self._poll_interval * 2, self.MAX_POLL_INTERVAL)
+        else:
+            # Keep HA-only operation responsive with a steady cadence.
+            # We only back off when the API is erroring.
+            self._poll_interval = self.MIN_POLL_INTERVAL
 
         self._last_refresh = time.time()
 
-    def _add_or_update_light(self, data: Dict[str, Any], is_group: bool) -> None:
+    def _add_or_update_light(self, data: Dict[str, Any], is_group: bool) -> bool:
         light_id = int(data["id"])
         if "type" not in data:
             data["type"] = "Group" if is_group else "Zone"
             
         if light_id in self._lights:
-            self._lights[light_id].update_from_data(data)
-        else:
-            data["lightId"] = light_id
-            self._lights[light_id] = Light(
-                self._credentials, 
-                self._location_id, 
-                light_id, 
-                data
-            )
+            return self._lights[light_id].update_from_data(data)
+
+        data["lightId"] = light_id
+        self._lights[light_id] = Light(
+            self._credentials,
+            self._location_id,
+            light_id,
+            data
+        )
+        return True
+
+    def mark_user_activity(self) -> None:
+        """Reset polling cadence to quickly capture follow-up state changes."""
+        self._poll_interval = self.MIN_POLL_INTERVAL
+        self._last_refresh = 0
 
     def get_lights(self) -> Dict[int, Light]:
         if not self._lights:

@@ -174,6 +174,7 @@ class HavenLight(LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
+        self._location.mark_user_activity()
         
         if ATTR_BRIGHTNESS in kwargs:
             ha_brightness = kwargs[ATTR_BRIGHTNESS]
@@ -206,12 +207,13 @@ class HavenLight(LightEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
+        self._location.mark_user_activity()
         await self.hass.async_add_executor_job(self._light.turn_off)
         await self.async_update()
 
     async def async_update(self) -> None:
         """Fetch new state data for this light."""
-        await self.hass.async_add_executor_job(self._location.refresh_devices, True)
+        await self.hass.async_add_executor_job(self._location.refresh_devices, False)
 
     def _find_closest_color_id(self, r, g, b):
         closest_dist = float('inf')
