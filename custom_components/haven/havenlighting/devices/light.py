@@ -34,19 +34,34 @@ class Light:
     def brightness(self) -> int:
         return int(self._data.brightness * 25.5)
 
-    def update_from_data(self, data: Dict[str, Any]) -> None:
+    def update_from_data(self, data: Dict[str, Any]) -> bool:
         is_on = data.get("isOn", False)
         # Handle potential key mismatch between Zones (lightBrightnessId) and Groups (brightnessId)
         brightness = data.get("lightBrightnessId", data.get("brightnessId", 10))
+
+        new_id = int(data.get("id", self._data.light_id if hasattr(self, '_data') else data.get("id")))
+        new_name = data.get("name", "Unknown")
+        new_status = 1 if is_on else 0
+        new_color = data.get("colorId")
+
+        has_changed = (
+            not hasattr(self, "_data")
+            or self._data.light_id != new_id
+            or self._data.name != new_name
+            or self._data.status != new_status
+            or self._data.brightness != brightness
+            or self._data.color != new_color
+        )
         
         self._data = LightData(
-            light_id=int(data.get("id", self._data.light_id if hasattr(self, '_data') else data.get("id"))),
-            name=data.get("name", "Unknown"),
-            status=1 if is_on else 0,
+            light_id=new_id,
+            name=new_name,
+            status=new_status,
             brightness=brightness,
-            color=data.get("colorId"),
+            color=new_color,
             pattern_speed=None
         )
+        return has_changed
 
     def turn_on(self) -> None:
         try:
