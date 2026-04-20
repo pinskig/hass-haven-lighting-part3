@@ -1,10 +1,10 @@
 {
   "domain": "haven",
-  "name": "Haven Lighting Redux",
+  "name": "Haven Lighting Part 3",
   "codeowners": ["@screscenti", "@mickeyschwab"],
   "config_flow": true,
-  "documentation": "https://github.com/screscenti/hass-haven-lighting-redux",
+  "documentation": "https://github.com/pinskig/hass-haven-lighting-part3",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/screscenti/hass-haven-lighting-redux/issues",
+  "issue_tracker": "https://github.com/pinskig/hass-haven-lighting-part3/issues",
   "version": "1.0.5"
 }
