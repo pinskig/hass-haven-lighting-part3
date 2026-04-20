@@ -1,4 +1,4 @@
-# Haven Lighting Redux
+# Haven Lighting Part 3
 
 A revived and modernized Home Assistant integration for **Haven Lighting** smart landscape systems.
 
@@ -10,12 +10,24 @@ A revived and modernized Home Assistant integration for **Haven Lighting** smart
 * **Full Control:** On/Off, Brightness (0-100%), RGB Color, and White Temperature (2700K - 5000K).
 * **Aggressive Sync:** Instantly updates all lights when a group is toggled (no more "janky" delays).
 * **Self-Cleaning:** Automatically removes deleted groups or zones on reload.
+* **Smarter Polling:** Maintains a steady refresh cadence and only backs off when the Haven API is under load.
+* **More Reliable API/Auth:** Updated API endpoints and session device-ID handling improve sign-in and day-to-day stability.
+
+## 🛠️ Recent Fixes Included
+
+This build includes the latest stability fixes from this repo, including:
+
+* Corrected Haven API base URLs for authentication and production requests.
+* Added session device-ID handling for improved auth compatibility.
+* Improved polling behavior to avoid drift while still responding to rate-limit signals.
+* Better logging around API rate-limit headers to simplify troubleshooting.
+* Version updates through **v1.0.5**.
 
 ## 🚀 Installation via HACS
 
 1. Open **HACS** in Home Assistant.
 2. Click the **three dots** (top right) > **Custom Repositories**.
-3. Add the URL of this repository: `https://github.com/screscenti/hass-haven-lighting-redux`
+3. Add this repository URL: `https://github.com/pinskig/hass-haven-lighting-part3`
 4. Select Category: **Integration**.
 5. Click **Download**.
 6. Restart Home Assistant.
@@ -23,7 +35,7 @@ A revived and modernized Home Assistant integration for **Haven Lighting** smart
 ## ⚙️ Configuration
 
 1. Go to **Settings > Devices & Services**.
-2. Click **Add Integration** > Search for **Haven Lighting**.
+2. Click **Add Integration** > Search for **Haven Lighting Part 3**.
 3. Enter your Haven Lighting **Username** (Email) and **Password**.
 4. Your zones and groups will automatically appear!
 
