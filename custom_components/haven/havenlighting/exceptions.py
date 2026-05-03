@@ -10,7 +10,14 @@ class HavenException(Exception):
 
 class ApiError(HavenException):
     """Raised when an API request fails."""
-    pass
+    def __init__(
+        self,
+        message: str,
+        code: Optional[int] = None,
+        retry_after: Optional[int] = None,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.retry_after = retry_after
 
 class AuthenticationError(HavenException):
     """Raised when authentication fails or is required but missing."""

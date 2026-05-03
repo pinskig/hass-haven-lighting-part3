@@ -182,7 +182,18 @@ class Credentials:
                 raise AuthenticationError("Received 401 Unauthorized response")
 
             if response.status_code == 429:
-                raise ApiError("Received 429 Too Many Requests response")
+                retry_after_seconds: Optional[int] = None
+                retry_after_header = response.headers.get("Retry-After")
+                if retry_after_header is not None:
+                    try:
+                        retry_after_seconds = int(retry_after_header)
+                    except ValueError:
+                        retry_after_seconds = None
+                raise ApiError(
+                    "Received 429 Too Many Requests response",
+                    code=429,
+                    retry_after=retry_after_seconds,
+                )
             
             response.raise_for_status()
             
