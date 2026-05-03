@@ -2,53 +2,62 @@
 
 A revived and modernized Home Assistant integration for **Haven Lighting** smart landscape systems.
 
-> ℹ️ **Note:** This project is a fork and "Redux" of the original [haven-hass](https://github.com/mickeyschwab/haven-hass) integration by **@mickeyschwab**. Major thanks to him for the original work! This version has been rewritten to support the new **Haven Lighting API (2025)** and restore functionality after the cloud migration.
+> ℹ️ **Note:** This project is a fork and "Redux" of the original [haven-hass](https://github.com/mickeyschwab/haven-hass) integration by **@mickeyschwab**. Huge thanks for the original work. This version was rewritten for the new **Haven Lighting API (2025)** after the platform cloud migration.
 
 ## 🌟 Features
-* **Zone Support:** Controls individual Zones (e.g., "Left House", "Path Lights") instead of just the main controller.
-* **Group Support:** Automatically imports your Haven App groups (e.g., "Evens", "Front Yard") as controllable lights.
-* **Full Control:** On/Off, Brightness (0-100%), RGB Color, and White Temperature (2700K - 5000K).
-* **Aggressive Sync:** Instantly updates all lights when a group is toggled (no more "janky" delays).
-* **Self-Cleaning:** Automatically removes deleted groups or zones on reload.
-* **Smarter Polling:** Maintains a steady refresh cadence and only backs off when the Haven API is under load.
-* **More Reliable API/Auth:** Updated API endpoints and session device-ID handling improve sign-in and day-to-day stability.
+- **Zone support:** Control individual zones (for example, "Left House" and "Path Lights").
+- **Group support:** Import Haven app groups (for example, "Evens" and "Front Yard") as entities.
+- **Full light controls:** On/off, brightness (0–100%), RGB color, and white temperature (2700K–5000K).
+- **Fast state sync:** Group changes fan out quickly to related entities.
+- **Entity cleanup:** Removed zones/groups are cleaned up on reload.
+- **Smarter polling:** Keeps a steady refresh cadence and backs off when the Haven API signals load/rate limits.
+- **Updated auth/API handling:** Modern endpoints and session device-ID behavior for improved login reliability.
 
-## 🛠️ Recent Fixes Included
+## 🧱 Compatibility
+- **Home Assistant:** Recent versions that support modern config entries/integration flows.
+- **Install method:** HACS custom repository.
+- **Account:** Valid Haven Lighting cloud account credentials.
 
-This build includes the latest stability fixes from this repo, including:
-
-* Corrected Haven API base URLs for authentication and production requests.
-* Added session device-ID handling for improved auth compatibility.
-* Improved polling behavior to avoid drift while still responding to rate-limit signals.
-* Better logging around API rate-limit headers to simplify troubleshooting.
-* Version updates through **v1.0.5**.
-
-## 🚀 Installation via HACS
-
+## 🚀 Installation (HACS)
 1. Open **HACS** in Home Assistant.
-2. Click the **three dots** (top right) > **Custom Repositories**.
-3. Add this repository URL: `https://github.com/pinskig/hass-haven-lighting-part3`
-4. Select Category: **Integration**.
-5. Click **Download**.
-6. Restart Home Assistant.
+2. Click the **three dots** (top-right) → **Custom repositories**.
+3. Add: `https://github.com/pinskig/hass-haven-lighting-part3`
+4. Category: **Integration**
+5. Click **Download** and then restart Home Assistant.
 
 ## ⚙️ Configuration
+1. Go to **Settings → Devices & Services**.
+2. Click **Add Integration** and search for **Haven Lighting Part 3**.
+3. Enter your Haven Lighting **username (email)** and **password**.
+4. After setup, your Haven zones/groups should appear as light entities.
 
-1. Go to **Settings > Devices & Services**.
-2. Click **Add Integration** > Search for **Haven Lighting Part 3**.
-3. Enter your Haven Lighting **Username** (Email) and **Password**.
-4. Your zones and groups will automatically appear!
+## 💡 Automation Tip (RGB/Brightness)
+In Home Assistant automations, advanced color controls are often easiest via a service call:
 
-## 💡 Automations & Color Control
+1. In your automation, add an **Action**.
+2. Choose **Call service**.
+3. Select **`light.turn_on`**.
+4. Target your Haven entity (for example, `light.front_yard`).
+5. Set fields such as **rgb_color**, **brightness**, or **color_temp_kelvin**.
 
-When creating automations in Home Assistant, the standard "Device" trigger often hides advanced color options. To control **RGB Color** and **Brightness** in an automation, you must use the **Call Service** action.
+## 🛠️ Troubleshooting
+- **Login fails:** Re-check Haven credentials and retry after a short wait.
+- **Entities missing:** Reload the integration or restart Home Assistant.
+- **Delayed updates:** Short API backoff windows can happen during rate limiting; behavior should recover automatically.
+- **Need logs:** Enable debug logging for `custom_components.haven` and inspect Home Assistant logs.
 
-1. In your Automation, scroll to **Actions**.
-2. Click **Add Action** and select **Call Service**.
-3. Search for and select **`light.turn_on`**.
-4. Choose your Haven entity (e.g., `light.front_yard`).
-5. Check the boxes for **RGB Color** or **Brightness** to set your desired look.
 
-## ❤️ Credits
-* **Original Creator:** [Mickey Schwab (@mickeyschwab)](https://github.com/mickeyschwab)
-* **2025 API Rewrite:** [Stephen Crescenti (@screscenti)](https://github.com/screscenti)
+## 📝 Changes & Updates (Maintainer + ChatGPT)
+To make recent updates easier to track, this section can be updated whenever you ship a change with ChatGPT support.
+
+### Latest updates
+- Documentation refresh for setup, automation guidance, and troubleshooting.
+- Clarified compatibility expectations and HACS install flow.
+
+### Suggested format for future updates
+- `YYYY-MM-DD` — Short summary of what changed.
+- `YYYY-MM-DD` — Another concise update note.
+
+## 🙌 Credits
+- **Original creator:** [Mickey Schwab (@mickeyschwab)](https://github.com/mickeyschwab)
+- **2025 API rewrite:** [Stephen Crescenti (@screscenti)](https://github.com/screscenti)
