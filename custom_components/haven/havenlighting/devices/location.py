@@ -4,13 +4,15 @@ import time
 from ..models import LocationData
 from .light import Light
 from ..credentials import Credentials
+from ..exceptions import ApiError
 
 logger = logging.getLogger(__name__)
 
 class Location:
     MIN_CAPABILITY_LEVEL: ClassVar[int] = 0
     MIN_POLL_INTERVAL: ClassVar[int] = 5
-    MAX_POLL_INTERVAL: ClassVar[int] = 80
+    MAX_POLL_INTERVAL: ClassVar[int] = 300
+    SUCCESS_BACKOFF_DECAY_FACTOR: ClassVar[int] = 2
     
     def __init__(self, credentials: Credentials, location_id: int, data: Optional[Dict[str, Any]] = None) -> None:
         self._credentials = credentials
@@ -24,6 +26,7 @@ class Location:
         self._last_refresh = 0
         self._poll_interval = self.MIN_POLL_INTERVAL
         self._real_location_name = None # Store the real name (e.g., "Crescenti Oasis")
+        self._consecutive_successes = 0
         
     @property
     def name(self) -> str:
@@ -49,6 +52,7 @@ class Location:
 
         has_changes = False
         had_error = False
+        had_rate_limit_error = False
         seen_light_ids: set[int] = set()
 
         # 1. Fetch Individual Zones
@@ -68,7 +72,15 @@ class Location:
                     seen_light_ids.add(int(item["id"]))
                     has_changes = self._add_or_update_light(item, is_group=False) or has_changes
         except Exception as e:
-            logger.error("Failed to refresh zones: %s", str(e))
+            is_rate_limited, is_transient_timeout = self._classify_refresh_error(e)
+            if is_rate_limited:
+                had_rate_limit_error = True
+            logger.error(
+                "Failed to refresh zones: %s (rate_limited=%s, transient_timeout=%s)",
+                str(e),
+                is_rate_limited,
+                is_transient_timeout,
+            )
             had_error = True
 
         # 2. Fetch Groups
@@ -92,7 +104,15 @@ class Location:
                 seen_light_ids.add(int(group_data["id"]))
                 has_changes = self._add_or_update_light(group_data, is_group=True) or has_changes
         except Exception as e:
-            logger.error("Failed to refresh groups: %s", str(e))
+            is_rate_limited, is_transient_timeout = self._classify_refresh_error(e)
+            if is_rate_limited:
+                had_rate_limit_error = True
+            logger.error(
+                "Failed to refresh groups: %s (rate_limited=%s, transient_timeout=%s)",
+                str(e),
+                is_rate_limited,
+                is_transient_timeout,
+            )
             had_error = True
 
         stale_light_ids = set(self._lights.keys()) - seen_light_ids
@@ -100,14 +120,42 @@ class Location:
             del self._lights[stale_light_id]
             has_changes = True
 
+        previous_poll_interval = self._poll_interval
         if had_error:
-            self._poll_interval = min(self._poll_interval * 2, self.MAX_POLL_INTERVAL)
+            self._consecutive_successes = 0
+            backoff_multiplier = 2 if had_rate_limit_error else self.SUCCESS_BACKOFF_DECAY_FACTOR
+            self._poll_interval = min(self._poll_interval * backoff_multiplier, self.MAX_POLL_INTERVAL)
         else:
-            # Keep HA-only operation responsive with a steady cadence.
-            # We only back off when the API is erroring.
-            self._poll_interval = self.MIN_POLL_INTERVAL
+            self._consecutive_successes += 1
+            if self._poll_interval > self.MIN_POLL_INTERVAL:
+                self._poll_interval = max(
+                    self.MIN_POLL_INTERVAL,
+                    self._poll_interval // self.SUCCESS_BACKOFF_DECAY_FACTOR,
+                )
+
+        if self._poll_interval != previous_poll_interval:
+            logger.info(
+                "Location %s poll interval changed from %ss to %ss "
+                "(had_error=%s, rate_limited=%s, consecutive_successes=%s)",
+                self._location_id,
+                previous_poll_interval,
+                self._poll_interval,
+                had_error,
+                had_rate_limit_error,
+                self._consecutive_successes,
+            )
 
         self._last_refresh = time.time()
+
+    def _classify_refresh_error(self, error: Exception) -> tuple[bool, bool]:
+        """Return flags for (is_rate_limited, is_transient_timeout)."""
+        if isinstance(error, ApiError):
+            error_message = str(error)
+            if "429" in error_message:
+                return True, False
+            if "timeout" in error_message.lower():
+                return False, True
+        return False, False
 
     def _add_or_update_light(self, data: Dict[str, Any], is_group: bool) -> bool:
         light_id = int(data["id"])
@@ -128,8 +176,17 @@ class Location:
 
     def mark_user_activity(self) -> None:
         """Reset polling cadence to quickly capture follow-up state changes."""
+        previous_poll_interval = self._poll_interval
         self._poll_interval = self.MIN_POLL_INTERVAL
         self._last_refresh = 0
+        self._consecutive_successes = 0
+        if self._poll_interval != previous_poll_interval:
+            logger.info(
+                "Location %s poll interval reset from %ss to %ss due to user activity",
+                self._location_id,
+                previous_poll_interval,
+                self._poll_interval,
+            )
 
     def get_lights(self) -> Dict[int, Light]:
         if not self._lights:
