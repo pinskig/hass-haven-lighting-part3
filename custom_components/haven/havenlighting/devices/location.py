@@ -13,6 +13,8 @@ class Location:
     MIN_POLL_INTERVAL: ClassVar[int] = 5
     MAX_POLL_INTERVAL: ClassVar[int] = 300
     SUCCESS_BACKOFF_DECAY_FACTOR: ClassVar[int] = 2
+    RATE_LIMIT_BACKOFF_STEPS: ClassVar[tuple[int, ...]] = (60, 300, 900)
+    STABLE_SUCCESS_THRESHOLD: ClassVar[int] = 3
     
     def __init__(self, credentials: Credentials, location_id: int, data: Optional[Dict[str, Any]] = None) -> None:
         self._credentials = credentials
@@ -27,6 +29,9 @@ class Location:
         self._poll_interval = self.MIN_POLL_INTERVAL
         self._real_location_name = None # Store the real name (e.g., "Crescenti Oasis")
         self._consecutive_successes = 0
+        self._consecutive_429 = 0
+        self._rate_limited_until = 0.0
+        self._rate_limit_error_suppressed = False
         
     @property
     def name(self) -> str:
@@ -47,7 +52,10 @@ class Location:
         return locations
 
     def refresh_devices(self, force: bool = False) -> None:
-        if not force and (time.time() - self._last_refresh < self._poll_interval):
+        now = time.time()
+        if not force and now < self._rate_limited_until:
+            return
+        if not force and (now - self._last_refresh < self._poll_interval):
             return
 
         has_changes = False
@@ -75,12 +83,7 @@ class Location:
             is_rate_limited, is_transient_timeout = self._classify_refresh_error(e)
             if is_rate_limited:
                 had_rate_limit_error = True
-            logger.error(
-                "Failed to refresh zones: %s (rate_limited=%s, transient_timeout=%s)",
-                str(e),
-                is_rate_limited,
-                is_transient_timeout,
-            )
+            self._log_refresh_error("zones", e, is_rate_limited, is_transient_timeout)
             had_error = True
 
         # 2. Fetch Groups
@@ -107,12 +110,7 @@ class Location:
             is_rate_limited, is_transient_timeout = self._classify_refresh_error(e)
             if is_rate_limited:
                 had_rate_limit_error = True
-            logger.error(
-                "Failed to refresh groups: %s (rate_limited=%s, transient_timeout=%s)",
-                str(e),
-                is_rate_limited,
-                is_transient_timeout,
-            )
+            self._log_refresh_error("groups", e, is_rate_limited, is_transient_timeout)
             had_error = True
 
         stale_light_ids = set(self._lights.keys()) - seen_light_ids
@@ -127,6 +125,10 @@ class Location:
             self._poll_interval = min(self._poll_interval * backoff_multiplier, self.MAX_POLL_INTERVAL)
         else:
             self._consecutive_successes += 1
+            if self._consecutive_successes >= self.STABLE_SUCCESS_THRESHOLD:
+                self._consecutive_429 = 0
+                self._rate_limited_until = 0.0
+                self._rate_limit_error_suppressed = False
             if self._poll_interval > self.MIN_POLL_INTERVAL:
                 self._poll_interval = max(
                     self.MIN_POLL_INTERVAL,
@@ -145,17 +147,69 @@ class Location:
                 self._consecutive_successes,
             )
 
-        self._last_refresh = time.time()
+        self._last_refresh = now
 
     def _classify_refresh_error(self, error: Exception) -> tuple[bool, bool]:
         """Return flags for (is_rate_limited, is_transient_timeout)."""
         if isinstance(error, ApiError):
-            error_message = str(error)
-            if "429" in error_message:
+            if self._is_rate_limit_error(error):
+                self._apply_rate_limit_backoff(error)
                 return True, False
+            error_message = str(error)
             if "timeout" in error_message.lower():
                 return False, True
         return False, False
+
+    def _is_rate_limit_error(self, error: ApiError) -> bool:
+        if getattr(error, "code", None) == 429:
+            return True
+        return "429" in str(error)
+
+    def _apply_rate_limit_backoff(self, error: ApiError) -> None:
+        self._consecutive_429 += 1
+        step_index = min(self._consecutive_429 - 1, len(self.RATE_LIMIT_BACKOFF_STEPS) - 1)
+        cooldown_seconds = self.RATE_LIMIT_BACKOFF_STEPS[step_index]
+        retry_after = getattr(error, "retry_after", None)
+        if isinstance(retry_after, int):
+            cooldown_seconds = min(max(cooldown_seconds, retry_after), self.RATE_LIMIT_BACKOFF_STEPS[-1])
+
+        now = time.time()
+        new_rate_limited_until = now + cooldown_seconds
+        extended = new_rate_limited_until > self._rate_limited_until
+        self._rate_limited_until = max(self._rate_limited_until, new_rate_limited_until)
+
+        if not self._rate_limit_error_suppressed:
+            logger.warning(
+                "Location %s entering rate-limit cooldown for %ss after 429 (retry_after=%s, consecutive_429=%s)",
+                self._location_id,
+                cooldown_seconds,
+                retry_after,
+                self._consecutive_429,
+            )
+            self._rate_limit_error_suppressed = True
+        elif extended:
+            logger.info(
+                "Location %s rate-limit cooldown extended to %.0f (epoch seconds)",
+                self._location_id,
+                self._rate_limited_until,
+            )
+
+    def _log_refresh_error(
+        self,
+        source: str,
+        error: Exception,
+        is_rate_limited: bool,
+        is_transient_timeout: bool,
+    ) -> None:
+        if is_rate_limited and self._rate_limit_error_suppressed:
+            return
+        logger.error(
+            "Failed to refresh %s: %s (rate_limited=%s, transient_timeout=%s)",
+            source,
+            str(error),
+            is_rate_limited,
+            is_transient_timeout,
+        )
 
     def _add_or_update_light(self, data: Dict[str, Any], is_group: bool) -> bool:
         light_id = int(data["id"])
