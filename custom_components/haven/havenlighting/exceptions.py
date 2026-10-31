@@ -15,8 +15,11 @@ class ApiError(HavenException):
         message: str,
         code: Optional[int] = None,
         retry_after: Optional[int] = None,
+        rate_limited_locally: bool = False,
     ) -> None:
         self.retry_after = retry_after
+        # True means the shared cooldown blocked this attempt before HTTP.
+        self.rate_limited_locally = rate_limited_locally
         super().__init__(message, code=code)
 
 class AuthenticationError(HavenException):

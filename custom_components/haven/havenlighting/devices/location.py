@@ -1,248 +1,204 @@
-from typing import Dict, Any, Optional, ClassVar
-import logging
+"""Discover and refresh a shared Haven location without duplicate requests."""
+
+from typing import Any, ClassVar, Dict, Optional
+import threading
 import time
-from ..models import LocationData
-from .light import Light
+
 from ..credentials import Credentials
 from ..exceptions import ApiError
+from ..models import LocationData
+from .light import Light
 
-logger = logging.getLogger(__name__)
 
 class Location:
     MIN_CAPABILITY_LEVEL: ClassVar[int] = 0
-    MIN_POLL_INTERVAL: ClassVar[int] = 5
-    MAX_POLL_INTERVAL: ClassVar[int] = 300
-    SUCCESS_BACKOFF_DECAY_FACTOR: ClassVar[int] = 2
-    RATE_LIMIT_BACKOFF_STEPS: ClassVar[tuple[int, ...]] = (60, 300, 900)
-    STABLE_SUCCESS_THRESHOLD: ClassVar[int] = 3
-    
-    def __init__(self, credentials: Credentials, location_id: int, data: Optional[Dict[str, Any]] = None) -> None:
+    MIN_POLL_INTERVAL: ClassVar[int] = 60
+
+    def __init__(
+        self,
+        credentials: Credentials,
+        location_id: int,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._credentials = credentials
         self._location_id = location_id
-        self._data = LocationData(
-            location_id=location_id,
-            name=data.get("name", str(location_id)),
-            owner_name=data.get("ownerName", "")
-        ) if data else None
+        self._data = (
+            LocationData(
+                location_id=location_id,
+                name=data.get("name", str(location_id)),
+                owner_name=data.get("ownerName", ""),
+            )
+            if data
+            else None
+        )
         self._lights: Dict[int, Light] = {}
-        self._last_refresh = 0
+        self._last_refresh: Optional[float] = None
         self._poll_interval = self.MIN_POLL_INTERVAL
-        self._real_location_name = None # Store the real name (e.g., "Crescenti Oasis")
-        self._consecutive_successes = 0
-        self._consecutive_429 = 0
-        self._rate_limited_until = 0.0
-        self._rate_limit_error_suppressed = False
-        
+        self._real_location_name: Optional[str] = None
+        self._refresh_lock = threading.Lock()
+        self._refresh_generation = 0
+        self._last_refresh_error: Optional[Exception] = None
+
+    @property
+    def location_id(self) -> int:
+        """Return the stable location identifier."""
+        return self._location_id
+
     @property
     def name(self) -> str:
-        # Return the real location name if we found it, otherwise fall back to Owner Name
-        return self._real_location_name or self._data.owner_name if self._data else str(self._location_id)
-        
+        """Return the location name discovered from Haven."""
+        if self._real_location_name:
+            return self._real_location_name
+        if self._data:
+            return self._data.owner_name or self._data.name
+        return str(self._location_id)
+
+    @property
+    def lights(self) -> Dict[int, Light]:
+        """Return a snapshot of the cached mapping without fetching data."""
+        return self._lights.copy()
+
     @classmethod
-    def discover(cls, credentials: Credentials) -> Dict[int, 'Location']:
+    def discover(cls, credentials: Credentials) -> Dict[int, "Location"]:
         response = credentials.make_request("GET", "/user/GetUserInfo", use_prod_api=True)
+        if not isinstance(response, dict):
+            raise ApiError("Invalid Haven user information response")
         locations = {}
         if "defaultLocationId" in response:
             loc_id = int(response["defaultLocationId"])
             loc_data = {
                 "name": str(loc_id),
-                "ownerName": f"{response.get('firstName', '')} {response.get('lastName', '')}".strip()
+                "ownerName": (
+                    f"{response.get('firstName', '')} {response.get('lastName', '')}"
+                ).strip(),
             }
             locations[loc_id] = cls(credentials, loc_id, loc_data)
         return locations
 
     def refresh_devices(self, force: bool = False) -> None:
-        now = time.time()
-        if not force and now < self._rate_limited_until:
-            return
-        if not force and (now - self._last_refresh < self._poll_interval):
-            return
+        """Fetch each collection once and publish only a complete valid result.
 
-        has_changes = False
-        had_error = False
-        had_rate_limit_error = False
-        seen_light_ids: set[int] = set()
+        Concurrent callers share the outcome of the refresh already in flight,
+        including callers using force. The coordinator may bypass the normal
+        cache interval, but every request still passes through Credentials' shared
+        rate-limit gate. A failed refresh leaves the previous cache untouched.
+        """
+        generation = self._refresh_generation
+        with self._refresh_lock:
+            if generation != self._refresh_generation:
+                if self._last_refresh_error is not None:
+                    raise self._last_refresh_error
+                return
 
-        # 1. Fetch Individual Zones
-        try:
-            response = self._credentials.make_request(
-                "GET", 
-                f"/LightAndZones/OrderedList/{self._location_id}", 
-                use_prod_api=True
-            )
-            zone_list = response if isinstance(response, list) else response.get("data", [])
-            for item in zone_list:
-                # CAPTURE THE REAL LOCATION NAME
-                if not self._real_location_name and "locationName" in item:
-                    self._real_location_name = item["locationName"]
-                    
-                if item.get("isZone"):
-                    seen_light_ids.add(int(item["id"]))
-                    has_changes = self._add_or_update_light(item, is_group=False) or has_changes
-        except Exception as e:
-            is_rate_limited, is_transient_timeout = self._classify_refresh_error(e)
-            if is_rate_limited:
-                had_rate_limit_error = True
-            self._log_refresh_error("zones", e, is_rate_limited, is_transient_timeout)
-            had_error = True
+            now = time.monotonic()
+            if (
+                not force
+                and self._last_refresh_error is None
+                and self._last_refresh is not None
+                and now - self._last_refresh
+                < max(self.MIN_POLL_INTERVAL, self._poll_interval)
+            ):
+                return
 
-        # 2. Fetch Groups
-        try:
-            response = self._credentials.make_request(
-                "GET", 
-                f"/Group/AllGroupsByLocation/{self._location_id}", 
-                use_prod_api=True
-            )
-            group_list = response if isinstance(response, list) else response.get("data", [])
-            for item in group_list:
-                group_data = {
-                    "id": item["groupId"],
-                    "name": item["groupName"],
-                    "isOn": item["isOn"],
-                    "lightBrightnessId": item.get("brightnessId", 10),
-                    "colorId": item.get("colorId"),
-                    "isZone": False,
-                    "type": "Group"
-                }
-                seen_light_ids.add(int(group_data["id"]))
-                has_changes = self._add_or_update_light(group_data, is_group=True) or has_changes
-        except Exception as e:
-            is_rate_limited, is_transient_timeout = self._classify_refresh_error(e)
-            if is_rate_limited:
-                had_rate_limit_error = True
-            self._log_refresh_error("groups", e, is_rate_limited, is_transient_timeout)
-            had_error = True
-
-        stale_light_ids = set(self._lights.keys()) - seen_light_ids
-        for stale_light_id in stale_light_ids:
-            del self._lights[stale_light_id]
-            has_changes = True
-
-        previous_poll_interval = self._poll_interval
-        if had_error:
-            self._consecutive_successes = 0
-            backoff_multiplier = 2 if had_rate_limit_error else self.SUCCESS_BACKOFF_DECAY_FACTOR
-            self._poll_interval = min(self._poll_interval * backoff_multiplier, self.MAX_POLL_INTERVAL)
-        else:
-            self._consecutive_successes += 1
-            if self._consecutive_successes >= self.STABLE_SUCCESS_THRESHOLD:
-                self._consecutive_429 = 0
-                self._rate_limited_until = 0.0
-                self._rate_limit_error_suppressed = False
-            if self._poll_interval > self.MIN_POLL_INTERVAL:
-                self._poll_interval = max(
-                    self.MIN_POLL_INTERVAL,
-                    self._poll_interval // self.SUCCESS_BACKOFF_DECAY_FACTOR,
+            try:
+                zone_response = self._credentials.make_request(
+                    "GET",
+                    f"/LightAndZones/OrderedList/{self._location_id}",
+                    use_prod_api=True,
                 )
+                zone_list = self._collection(zone_response, "zones")
+                staged_lights: Dict[int, Light] = {}
+                location_name = self._real_location_name
 
-        if self._poll_interval != previous_poll_interval:
-            logger.info(
-                "Location %s poll interval changed from %ss to %ss "
-                "(had_error=%s, rate_limited=%s, consecutive_successes=%s)",
-                self._location_id,
-                previous_poll_interval,
-                self._poll_interval,
-                had_error,
-                had_rate_limit_error,
-                self._consecutive_successes,
-            )
+                for item in zone_list:
+                    if "isZone" not in item:
+                        raise ApiError("Invalid Haven zones response: missing isZone")
+                    if not location_name and item.get("locationName"):
+                        location_name = str(item["locationName"])
+                    if item.get("isZone"):
+                        light = self._stage_light(item, is_group=False)
+                        staged_lights[light.id] = light
 
-        self._last_refresh = now
+                # No catch-and-continue: a zones failure must stop the refresh
+                # before another endpoint is called, particularly after a 429.
+                group_response = self._credentials.make_request(
+                    "GET",
+                    f"/Group/AllGroupsByLocation/{self._location_id}",
+                    use_prod_api=True,
+                )
+                group_list = self._collection(group_response, "groups")
+                for item in group_list:
+                    group_data = {
+                        "id": item["groupId"],
+                        "name": item["groupName"],
+                        "isOn": item["isOn"],
+                        "lightBrightnessId": item.get("brightnessId", 10),
+                        "colorId": item.get("colorId"),
+                        "isZone": False,
+                        "type": "Group",
+                    }
+                    light = self._stage_light(group_data, is_group=True)
+                    staged_lights[light.id] = light
 
-    def _classify_refresh_error(self, error: Exception) -> tuple[bool, bool]:
-        """Return flags for (is_rate_limited, is_transient_timeout)."""
-        if isinstance(error, ApiError):
-            if self._is_rate_limit_error(error):
-                self._apply_rate_limit_backoff(error)
-                return True, False
-            error_message = str(error)
-            if "timeout" in error_message.lower():
-                return False, True
-        return False, False
+                # All network calls and parsing succeeded. Keep existing Light
+                # objects because the Home Assistant entities hold references to
+                # them; publish additions/removals only after full validation.
+                for light_id, staged in tuple(staged_lights.items()):
+                    if existing := self._lights.get(light_id):
+                        existing._data = staged._data
+                        existing._type = staged._type
+                        staged_lights[light_id] = existing
+                self._lights = staged_lights
+                self._real_location_name = location_name
+                self._last_refresh = time.monotonic()
+                self._last_refresh_error = None
+            except (KeyError, TypeError, ValueError) as error:
+                api_error = ApiError(f"Invalid Haven location data: {error}")
+                self._last_refresh_error = api_error
+                raise api_error from error
+            except Exception as error:
+                # Preserve ApiError/code/retry_after and authentication errors
+                # so the coordinator can mark entities unavailable and back off.
+                self._last_refresh_error = error
+                raise
+            finally:
+                self._refresh_generation += 1
 
-    def _is_rate_limit_error(self, error: ApiError) -> bool:
-        if getattr(error, "code", None) == 429:
-            return True
-        return "429" in str(error)
+    @staticmethod
+    def _collection(response: Any, source: str) -> list[Dict[str, Any]]:
+        """Reject malformed payloads instead of treating them as empty lists."""
+        if isinstance(response, list):
+            items = response
+        elif isinstance(response, dict) and isinstance(response.get("data"), list):
+            items = response["data"]
+        else:
+            raise ApiError(f"Invalid Haven {source} response: expected a list")
+        if not all(isinstance(item, dict) for item in items):
+            raise ApiError(f"Invalid Haven {source} response: expected objects")
+        return items
 
-    def _apply_rate_limit_backoff(self, error: ApiError) -> None:
-        self._consecutive_429 += 1
-        step_index = min(self._consecutive_429 - 1, len(self.RATE_LIMIT_BACKOFF_STEPS) - 1)
-        cooldown_seconds = self.RATE_LIMIT_BACKOFF_STEPS[step_index]
-        retry_after = getattr(error, "retry_after", None)
-        if isinstance(retry_after, int):
-            cooldown_seconds = min(max(cooldown_seconds, retry_after), self.RATE_LIMIT_BACKOFF_STEPS[-1])
-
-        now = time.time()
-        new_rate_limited_until = now + cooldown_seconds
-        extended = new_rate_limited_until > self._rate_limited_until
-        self._rate_limited_until = max(self._rate_limited_until, new_rate_limited_until)
-
-        if not self._rate_limit_error_suppressed:
-            logger.warning(
-                "Location %s entering rate-limit cooldown for %ss after 429 (retry_after=%s, consecutive_429=%s)",
-                self._location_id,
-                cooldown_seconds,
-                retry_after,
-                self._consecutive_429,
-            )
-            self._rate_limit_error_suppressed = True
-        elif extended:
-            logger.info(
-                "Location %s rate-limit cooldown extended to %.0f (epoch seconds)",
-                self._location_id,
-                self._rate_limited_until,
-            )
-
-    def _log_refresh_error(
-        self,
-        source: str,
-        error: Exception,
-        is_rate_limited: bool,
-        is_transient_timeout: bool,
-    ) -> None:
-        if is_rate_limited and self._rate_limit_error_suppressed:
-            return
-        logger.error(
-            "Failed to refresh %s: %s (rate_limited=%s, transient_timeout=%s)",
-            source,
-            str(error),
-            is_rate_limited,
-            is_transient_timeout,
+    def _stage_light(self, data: Dict[str, Any], is_group: bool) -> Light:
+        """Validate a candidate without changing any previously cached light."""
+        normalized = dict(data)
+        light_id = int(normalized["id"])
+        normalized["id"] = light_id
+        normalized["lightId"] = light_id
+        normalized.setdefault("type", "Group" if is_group else "Zone")
+        normalized["lightBrightnessId"] = int(
+            normalized.get("lightBrightnessId", normalized.get("brightnessId", 10))
         )
-
-    def _add_or_update_light(self, data: Dict[str, Any], is_group: bool) -> bool:
-        light_id = int(data["id"])
-        if "type" not in data:
-            data["type"] = "Group" if is_group else "Zone"
-            
-        if light_id in self._lights:
-            return self._lights[light_id].update_from_data(data)
-
-        data["lightId"] = light_id
-        self._lights[light_id] = Light(
-            self._credentials,
-            self._location_id,
-            light_id,
-            data
-        )
-        return True
+        return Light(self._credentials, self._location_id, light_id, normalized)
 
     def mark_user_activity(self) -> None:
-        """Reset polling cadence to quickly capture follow-up state changes."""
-        previous_poll_interval = self._poll_interval
-        self._poll_interval = self.MIN_POLL_INTERVAL
-        self._last_refresh = 0
-        self._consecutive_successes = 0
-        if self._poll_interval != previous_poll_interval:
-            logger.info(
-                "Location %s poll interval reset from %ss to %ss due to user activity",
-                self._location_id,
-                previous_poll_interval,
-                self._poll_interval,
-            )
+        """Keep the compatibility hook without resetting polling or cooldowns.
+
+        Command callers request a debounced refresh from the shared coordinator.
+        User activity must not clear a server-imposed cooldown or accelerate all
+        entities' background polling.
+        """
 
     def get_lights(self) -> Dict[int, Light]:
-        if not self._lights:
+        """Discover lights once, including a valid empty discovery result."""
+        if self._last_refresh is None:
             self.refresh_devices()
-        return self._lights
+        return self.lights

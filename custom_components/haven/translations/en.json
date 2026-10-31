@@ -1,0 +1,31 @@
+{
+  "title": "Haven Lighting Part 3",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Haven",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect to Haven",
+        "description": "Enter the password for {email} to restore the connection.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "The Haven email or password was not accepted.",
+      "cannot_connect": "Haven is temporarily unavailable or limiting requests. Wait before trying again.",
+      "unknown": "An unexpected error occurred. Check the Home Assistant logs."
+    },
+    "abort": {
+      "already_configured": "This Haven account is already configured.",
+      "reauth_successful": "Haven credentials updated successfully.",
+      "reauth_entry_missing": "The Haven integration entry no longer exists."
+    }
+  }
+}

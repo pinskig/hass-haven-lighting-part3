@@ -64,36 +64,24 @@ class Light:
         return has_changed
 
     def turn_on(self) -> None:
-        try:
-            self._send_simple_command("/Commands/On")
-            self._data.status = 1
-        except Exception as e:
-            logger.error("Failed to turn on %s", str(e))
+        self._send_simple_command("/Commands/On")
+        self._data.status = 1
 
     def turn_off(self) -> None:
-        try:
-            self._send_simple_command("/Commands/Off")
-            self._data.status = 0
-        except Exception as e:
-            logger.error("Failed to turn off %s", str(e))
+        self._send_simple_command("/Commands/Off")
+        self._data.status = 0
 
     def set_brightness(self, level: int) -> None:
         level = max(0, min(10, int(level)))
-        try:
-            payload = {"id": self.id, "type": self._type, "brightness": level}
-            self._credentials.make_request("POST", "/Commands/Brightness", json=payload, use_prod_api=True)
-            self._data.brightness = level
-            self._data.status = 1 
-        except Exception as e:
-            logger.error("Failed to set brightness %s", str(e))
+        payload = {"id": self.id, "type": self._type, "brightness": level}
+        self._credentials.make_request("POST", "/Commands/Brightness", json=payload, use_prod_api=True)
+        self._data.brightness = level
+        self._data.status = 1
 
     def set_color(self, color_id: int) -> None:
-        try:
-            payload = {"id": self.id, "type": self._type, "colorId": int(color_id)}
-            self._credentials.make_request("POST", "/Commands/SetColor", json=payload, use_prod_api=True)
-            self._data.color = color_id
-        except Exception as e:
-            logger.error("Failed to set color %s", str(e))
+        payload = {"id": self.id, "type": self._type, "colorId": int(color_id)}
+        self._credentials.make_request("POST", "/Commands/SetColor", json=payload, use_prod_api=True)
+        self._data.color = color_id
 
     def _send_simple_command(self, endpoint: str) -> None:
         payload = {"id": self.id, "type": self._type}

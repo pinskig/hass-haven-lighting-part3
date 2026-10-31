@@ -25,6 +25,11 @@ class HavenClient:
         self._lights: Dict[int, Light] = {}
         logger.debug("Initialized HavenClient")
 
+    @property
+    def is_authenticated(self) -> bool:
+        """Whether this client already holds credentials for setup retries."""
+        return self._credentials.is_authenticated
+
     def authenticate(self, email: str, password: str) -> bool:
         """
         Authenticate with the Haven Lighting service.
