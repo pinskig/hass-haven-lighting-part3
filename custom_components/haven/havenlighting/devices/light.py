@@ -1,88 +1,145 @@
-from typing import Dict, Any
-import logging
-from ..models import LightData
-from ..credentials import Credentials
+"""Commands for one stable target, backed by immutable state snapshots."""
 
-logger = logging.getLogger(__name__)
+from __future__ import annotations
+
+from dataclasses import replace
+import threading
+from typing import Any
+
+from ..credentials import Credentials
+from ..exceptions import ApiError
+from ..models import LightState, TargetKey, TargetKind
+from ..parsing import haven_to_ha_brightness, parse_integer, parse_target_state
+
 
 class Light:
-    """Represents a Haven light device."""
+    """Keep command identity fixed when another target shares its number."""
 
-    def __init__(self, credentials: Credentials, location_id: int, light_id: int, data: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        credentials: Credentials,
+        location_id: int | None = None,
+        light_id: int | None = None,
+        data: dict[str, Any] | None = None,
+        *,
+        kind: TargetKind = "Zone",
+        state: LightState | None = None,
+        operation_lock: Any = None,
+        state_lock: Any = None,
+    ) -> None:
+        # Preserve the old zone constructor. Discovery supplies parsed states.
+        if state is None:
+            state = parse_target_state(location_id, kind, data)
+            expected_id = parse_integer(light_id, "light ID", minimum=1)
+            if state.key.remote_id != expected_id:
+                raise ApiError("Light ID does not match its payload")
+        elif not isinstance(state, LightState):
+            raise ValueError("state must be a LightState")
+        elif any(value is not None for value in (location_id, light_id, data)):
+            raise ValueError("Provide either state or legacy constructor fields")
+
         self._credentials = credentials
-        self.location_id = location_id
-        self._type = "Zone" if data.get("isZone") else "Device"
-        if data.get("type"):
-            self._type = data.get("type")
-            
-        self.update_from_data(data)
-        logger.debug("Initialized Light: %s (ID: %d, Type: %s)", self.name, self.id, self._type)
+        self._key = state.key
+        self._state = state
+        self._operation_lock = operation_lock if operation_lock is not None else threading.Lock()
+        self._state_lock = state_lock if state_lock is not None else threading.RLock()
+
+    @classmethod
+    def from_state(
+        cls,
+        credentials: Credentials,
+        state: LightState,
+        *,
+        operation_lock: Any = None,
+        state_lock: Any = None,
+    ) -> Light:
+        return cls(
+            credentials,
+            state=state,
+            operation_lock=operation_lock,
+            state_lock=state_lock,
+        )
+
+    @property
+    def key(self) -> TargetKey:
+        return self._key
+
+    @property
+    def kind(self) -> TargetKind:
+        return self._key.kind
 
     @property
     def id(self) -> int:
-        return self._data.light_id
+        return self._key.remote_id
+
+    @property
+    def location_id(self) -> int:
+        return self._key.location_id
+
+    @property
+    def state(self) -> LightState:
+        with self._state_lock:
+            return self._state
 
     @property
     def name(self) -> str:
-        return self._data.name
+        return self.state.name
 
     @property
     def is_on(self) -> bool:
-        return self._data.status == 1
+        return self.state.is_on
 
     @property
     def brightness(self) -> int:
-        return int(self._data.brightness * 25.5)
+        return self.state.brightness
 
-    def update_from_data(self, data: Dict[str, Any]) -> bool:
-        is_on = data.get("isOn", False)
-        # Handle potential key mismatch between Zones (lightBrightnessId) and Groups (brightnessId)
-        brightness = data.get("lightBrightnessId", data.get("brightnessId", 10))
+    @property
+    def color_id(self) -> int | None:
+        return self.state.color_id
 
-        new_id = int(data.get("id", self._data.light_id if hasattr(self, '_data') else data.get("id")))
-        new_name = data.get("name", "Unknown")
-        new_status = 1 if is_on else 0
-        new_color = data.get("colorId")
+    @property
+    def _type(self) -> TargetKind:
+        """Read-only compatibility alias; command kind is part of the key."""
+        return self.kind
 
-        has_changed = (
-            not hasattr(self, "_data")
-            or self._data.light_id != new_id
-            or self._data.name != new_name
-            or self._data.status != new_status
-            or self._data.brightness != brightness
-            or self._data.color != new_color
-        )
-        
-        self._data = LightData(
-            light_id=new_id,
-            name=new_name,
-            status=new_status,
-            brightness=brightness,
-            color=new_color,
-            pattern_speed=None
-        )
-        return has_changed
+    def _publish_state(self, state: LightState) -> None:
+        """Publish a parsed record without changing this object's identity."""
+        if state.key != self._key:
+            raise ValueError("Cannot replace a light with another target's state")
+        with self._state_lock:
+            self._state = state
+
+    def update_from_data(self, data: dict[str, Any]) -> bool:
+        """Compatibility helper for a normalized record of this same target."""
+        candidate = parse_target_state(self.location_id, self.kind, data)
+        with self._operation_lock:
+            previous = self.state
+            self._publish_state(candidate)
+            return previous != candidate
+
+    def _send_command(self, endpoint: str, *, changes: dict[str, Any], **values: Any) -> None:
+        # Shared with the location's full poll, so an older poll cannot publish
+        # over a command that completed while its network requests were pending.
+        with self._operation_lock:
+            payload = {"id": self.id, "type": self.kind, **values}
+            self._credentials.make_request("POST", endpoint, json=payload, use_prod_api=True)
+            with self._state_lock:
+                self._state = replace(self._state, **changes)
 
     def turn_on(self) -> None:
-        self._send_simple_command("/Commands/On")
-        self._data.status = 1
+        self._send_command("/Commands/On", changes={"is_on": True})
 
     def turn_off(self) -> None:
-        self._send_simple_command("/Commands/Off")
-        self._data.status = 0
+        self._send_command("/Commands/Off", changes={"is_on": False})
 
     def set_brightness(self, level: int) -> None:
-        level = max(0, min(10, int(level)))
-        payload = {"id": self.id, "type": self._type, "brightness": level}
-        self._credentials.make_request("POST", "/Commands/Brightness", json=payload, use_prod_api=True)
-        self._data.brightness = level
-        self._data.status = 1
+        level = parse_integer(level, "brightness", maximum=10)
+        self._send_command(
+            "/Commands/Brightness",
+            changes={"brightness": haven_to_ha_brightness(level), "is_on": True},
+            brightness=level,
+        )
 
     def set_color(self, color_id: int) -> None:
-        payload = {"id": self.id, "type": self._type, "colorId": int(color_id)}
-        self._credentials.make_request("POST", "/Commands/SetColor", json=payload, use_prod_api=True)
-        self._data.color = color_id
-
-    def _send_simple_command(self, endpoint: str) -> None:
-        payload = {"id": self.id, "type": self._type}
-        self._credentials.make_request("POST", endpoint, json=payload, use_prod_api=True)
+        color_id = parse_integer(color_id, "colorId")
+        self._send_command("/Commands/SetColor", changes={"color_id": color_id}, colorId=color_id)

@@ -1,74 +1,109 @@
-from typing import Dict, Any, Optional
+"""Authentication and a persistent HTTP session behind an account request gate."""
+
+from __future__ import annotations
+
 from datetime import timezone
 from email.utils import parsedate_to_datetime
-import math
-import requests
 import logging
-import threading
+import math
 import time
+from typing import Any
 import uuid
-from .exceptions import AuthenticationError, ApiError
-from .config import API_TIMEOUT
 
-# GIADA FIX: Pointing to STAGING (stg-api) because that is where the account lives
-AUTH_API_BASE = "https://stg-api.havenlighting.com/api"
-PROD_API_BASE = "https://stg-api.havenlighting.com/api"
+import requests
+
+from .config import ApiConfig
+from .exceptions import AuthenticationError, ApiError
+from .request_gate import RequestGate
 
 logger = logging.getLogger(__name__)
 
-class Credentials:
-    """Own authentication and the shared request budget for one client.
 
-    Every endpoint, including login, token renewal, and commands, uses the same
-    transport lock and cooldown. This synchronous client runs in HA's executor;
-    only the short spacing between requests sleeps. Longer cooldowns raise an
-    ApiError immediately so the caller can schedule a later attempt.
+class _ExplicitAuthorization(requests.auth.AuthBase):
+    """Keep the caller's Authorization header authoritative over ambient netrc."""
+
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
+        return request
+
+
+class Credentials:
+    """Own one authenticated session; share the provider budget across clients.
+
+    All session use, token renewal, and retries hold the account gate's lock.
+    Requests uses explicit connect/read inactivity timeouts, not a hard total
+    deadline. Only a 401 permits one token renewal and retry; transport failures
+    and commands are never silently replayed.
     """
 
-    DEFAULT_REQUEST_INTERVAL = 1.0
-    RATE_LIMIT_BACKOFF_STEPS = (60, 300, 900)
-    STABLE_SUCCESS_THRESHOLD = 3
-    
-    def __init__(self, min_request_interval: float = DEFAULT_REQUEST_INTERVAL):
-        if not math.isfinite(min_request_interval) or min_request_interval < 0:
-            raise ValueError("min_request_interval must be a finite, nonnegative number")
-        self._request_lock = threading.RLock()
-        self._min_request_interval = float(min_request_interval)
-        self._next_request_at = 0.0
-        self._rate_limited_until = 0.0
-        self._consecutive_429 = 0
-        self._consecutive_successes = 0
-        self._token: Optional[str] = None
-        self._refresh_token: Optional[str] = None
-        self._user_id: Optional[int] = None
-        # Generate a standard UUID for the session
+    DEFAULT_REQUEST_INTERVAL = RequestGate.DEFAULT_REQUEST_INTERVAL
+    RATE_LIMIT_BACKOFF_STEPS = RequestGate.RATE_LIMIT_BACKOFF_STEPS
+
+    def __init__(
+        self,
+        min_request_interval: float | None = None,
+        *,
+        request_gate: RequestGate | None = None,
+        api_config: ApiConfig | None = None,
+    ) -> None:
+        if request_gate is None:
+            request_gate = RequestGate(
+                self.DEFAULT_REQUEST_INTERVAL
+                if min_request_interval is None else min_request_interval
+            )
+        elif min_request_interval is not None and (
+            min_request_interval != request_gate.min_request_interval
+        ):
+            raise ValueError("Configure request spacing on the shared RequestGate")
+        self._gate = request_gate
+        self._request_lock = request_gate.lock
+        self._api_config = api_config or ApiConfig()
+        self._session = requests.Session()
+        # Explicit request headers define Haven authentication. Environment proxy
+        # and CA settings remain available, but netrc must not replace the JWT.
+        self._session.auth = _ExplicitAuthorization()
+        self._closed = False
+        self._token: str | None = None
+        self._refresh_token: str | None = None
+        self._user_id: int | str | None = None
         self._session_device_id = str(uuid.uuid4())
-        logger.debug(f"Initialized Credentials with Device ID: {self._session_device_id}")
-        
+
     @property
     def is_authenticated(self) -> bool:
-        return bool(self._token and self._user_id)
+        return not self._closed and bool(self._token and self._user_id)
+
+    @property
+    def account_id(self) -> str | None:
+        """Return the authenticated API account ID, never the login email."""
+        return str(self._user_id) if self._user_id is not None else None
+
+    @property
+    def request_gate(self) -> RequestGate:
+        return self._gate
 
     @property
     def rate_limit_remaining(self) -> int:
-        """Return the remaining shared cooldown, rounded up to whole seconds."""
-        with self._request_lock:
-            return max(0, math.ceil(self._rate_limited_until - time.monotonic()))
+        return self._gate.rate_limit_remaining
 
-    def _raise_if_rate_limited(self) -> None:
-        """Block locally without extending an existing server cooldown."""
-        remaining = self.rate_limit_remaining
-        if remaining:
-            raise ApiError(
-                f"Haven API cooldown active; retry in {remaining} seconds",
-                code=429,
-                retry_after=remaining,
-                rate_limited_locally=True,
-            )
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Close pooled connections without altering the account's cooldown.
+
+        This method is synchronous and waits for any active account request.
+        Home Assistant callers should invoke it through the executor.
+        """
+        with self._request_lock:
+            if not self._closed:
+                self._session.close()
+                self._closed = True
+                self._token = None
+                self._refresh_token = None
 
     @staticmethod
-    def _parse_retry_after(value: Optional[str]) -> Optional[int]:
-        """Accept delay seconds or an HTTP date without rounding a delay down."""
+    def _parse_retry_after(value: str | None) -> int | None:
+        """Accept delay seconds or an HTTP date without rounding down."""
         if not value:
             return None
         try:
@@ -87,110 +122,61 @@ class Credentials:
             logger.debug("Unable to parse Retry-After header value: %s", value)
             return None
 
-    def _record_rate_limit(self, retry_after: Optional[int]) -> int:
-        """Start/extend cooldown only after an actual HTTP 429 response."""
-        self._consecutive_429 += 1
-        self._consecutive_successes = 0
-        step = min(self._consecutive_429 - 1, len(self.RATE_LIMIT_BACKOFF_STEPS) - 1)
-        delay = max(self.RATE_LIMIT_BACKOFF_STEPS[step], retry_after or 0)
-        self._rate_limited_until = max(
-            self._rate_limited_until, time.monotonic() + delay
-        )
-        logger.warning(
-            "Haven API rate limited; all requests paused for %ss (Retry-After=%s)",
-            self.rate_limit_remaining,
-            retry_after,
-        )
-        return self.rate_limit_remaining
-
-    def _record_success(self) -> None:
-        self._consecutive_successes += 1
-        if self._consecutive_successes >= self.STABLE_SUCCESS_THRESHOLD:
-            self._consecutive_429 = 0
-        
     def authenticate(self, email: str, password: str) -> bool:
-        """Authenticate with the Haven Lighting service."""
+        """Authenticate without a stale bearer token on the anonymous endpoint."""
         with self._request_lock:
-            return self._authenticate_locked(email, password)
-
-    def _authenticate_locked(self, email: str, password: str) -> bool:
-        logger.debug("Attempting authentication for user: %s", email)
-        
-        # GIADA FIX: The "Double-Barreled" Payload
-        # We send BOTH Username and Email to satisfy different server versions.
-        # We point to stg-api because that is where the account validated.
-        payload = {
-            "Username": email,  # Required by Staging
-            "Email": email,     # Required by newer logic
-            "Password": password,
-            "DeviceId": self._session_device_id
-        }
-        
-        try:
-            # Headers to mimic a real browser/app
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Content-Type": "application/json",
-                "Accept": "application/json"
+            payload = {
+                "Username": email,
+                "Email": email,
+                "Password": password,
+                "DeviceId": self._session_device_id,
             }
-
             response = self._make_request_internal(
-                "POST",
-                "/Auth/Authenticate", 
-                json=payload,
-                headers=headers,
-                auth_required=False
+                "POST", "/Auth/Authenticate", json=payload, auth_required=False
             )
-            
-            self._update_credentials(response)
-            logger.info("Successfully authenticated user: %s", email)
+            self._update_credentials(response, preserve_refresh_token=False)
+            logger.debug("Haven authentication succeeded")
             return True
-            
-        except ApiError as e:
-            logger.error("Authentication failed for user %s: %s", email, str(e))
-            raise
-            
-    def refresh_token(self) -> bool:
-        """Refresh the authentication token."""
-        with self._request_lock:
-            return self._refresh_token_locked()
 
-    def _refresh_token_locked(self) -> bool:
-        if not self._refresh_token or not self._user_id:
-            logger.debug("Cannot refresh token - missing refresh token or user ID")
-            return False
-        
-        try:
-            logger.debug("Attempting token refresh for user ID: %s", self._user_id)
+    def refresh_token(self) -> bool:
+        """Refresh credentials while preserving the original rate-limit error."""
+        with self._request_lock:
+            if not self._refresh_token or not self._user_id:
+                return False
             response = self._make_request_internal(
                 "POST",
                 "/Auth/Refresh",
-                json={
-                    "refreshToken": self._refresh_token,
-                    "userId": self._user_id
-                },
-                auth_required=False
+                json={"refreshToken": self._refresh_token, "userId": self._user_id},
+                auth_required=False,
             )
             self._update_credentials(response)
-            logger.debug("Token refresh successful")
             return True
-            
-        except ApiError as e:
-            logger.error("Token refresh failed: %s", str(e))
-            raise
-            
-    def _update_credentials(self, data: Dict[str, Any]) -> None:
-        """Validate the complete response before replacing working credentials."""
+
+    def _update_credentials(
+        self, data: dict[str, Any], *, preserve_refresh_token: bool = True
+    ) -> None:
+        """Validate all fields before replacing working credentials."""
         if not isinstance(data, dict):
             raise ApiError("Invalid authentication response: expected an object")
         token = data.get("token")
         user_id = data.get("id")
-        if not isinstance(token, str) or not token.strip() or not user_id:
-            raise ApiError("Invalid authentication response: missing token or user ID")
+        if not isinstance(token, str) or not token.strip():
+            raise ApiError("Invalid authentication response: missing token")
+        if (
+            isinstance(user_id, bool)
+            or not isinstance(user_id, (int, str))
+            or (isinstance(user_id, int) and user_id <= 0)
+            or (isinstance(user_id, str) and (not user_id.strip() or len(user_id) > 256))
+        ):
+            raise ApiError("Invalid authentication response: invalid user ID")
+        if isinstance(user_id, str):
+            user_id = user_id.strip()
 
-        # Some renewals may keep the existing refresh token. An omitted field
-        # must not erase it; an explicitly malformed field rejects the response.
-        refresh_token = data.get("refreshToken", self._refresh_token)
+        previous_refresh = (
+            self._refresh_token
+            if preserve_refresh_token and str(user_id) == self.account_id else None
+        )
+        refresh_token = data.get("refreshToken", previous_refresh)
         if "refreshToken" in data and (
             not isinstance(refresh_token, str) or not refresh_token.strip()
         ):
@@ -199,152 +185,119 @@ class Credentials:
         self._token = token
         self._refresh_token = refresh_token
         self._user_id = user_id
-        
+
     def make_request(
-        self, 
-        method: str, 
-        path: str, 
-        auth_required: bool = True,
-        use_prod_api: bool = False,
-        timeout: int = API_TIMEOUT,
-        **kwargs: Any
-    ) -> Dict[str, Any]:
-        """Make an authenticated API request with automatic token refresh."""
-        # Hold the lock through token renewal and the retry. A queued caller
-        # therefore starts with the renewed token rather than refreshing again.
-        with self._request_lock:
-            return self._make_request_locked(
-                method, path, auth_required, use_prod_api, timeout, **kwargs
-            )
-
-    def _make_request_locked(
         self,
         method: str,
         path: str,
-        auth_required: bool,
-        use_prod_api: bool,
-        timeout: int,
+        auth_required: bool = True,
+        use_prod_api: bool = False,
+        timeout: int | float | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
-        try:
-            return self._make_request_internal(
-                method=method, 
-                path=path, 
-                auth_required=auth_required,
-                use_prod_api=use_prod_api,
-                timeout=timeout,
-                **kwargs
-            )
-        except AuthenticationError:
-            if not auth_required:
-                raise
-            logger.info("Authentication error, attempting token refresh")
-            if self.refresh_token():
-                logger.info("Token refresh successful, retrying request")
+    ) -> Any:
+        """Make a request, with one serialized token renewal after a 401."""
+        with self._request_lock:
+            try:
                 return self._make_request_internal(
-                    method=method, 
-                    path=path, 
-                    auth_required=auth_required,
-                    use_prod_api=use_prod_api,
-                    timeout=timeout,
-                    **kwargs
+                    method, path, auth_required, use_prod_api, timeout, **kwargs
                 )
-            logger.error("Token refresh failed, unable to retry request")
-            raise AuthenticationError("Token refresh failed")
-        
-    def _make_request_internal(
-        self, 
-        method: str, 
-        path: str, 
-        auth_required: bool = True,
-        use_prod_api: bool = False,
-        timeout: int = API_TIMEOUT,
-        **kwargs: Any
-    ) -> Dict[str, Any]:
-        """Internal method for making API requests."""
-        with self._request_lock:
-            return self._request_locked(
-                method, path, auth_required, use_prod_api, timeout, **kwargs
-            )
+            except AuthenticationError:
+                if not auth_required:
+                    raise
+                if self.refresh_token():
+                    return self._make_request_internal(
+                        method, path, auth_required, use_prod_api, timeout, **kwargs
+                    )
+                raise AuthenticationError("Token refresh failed") from None
 
-    def _request_locked(
+    def _make_request_internal(
         self,
         method: str,
         path: str,
-        auth_required: bool,
-        use_prod_api: bool,
-        timeout: int,
+        auth_required: bool = True,
+        use_prod_api: bool = False,
+        timeout: int | float | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
-        self._raise_if_rate_limited()
-        if auth_required and not self.is_authenticated:
-            raise AuthenticationError("Authentication required")
+    ) -> Any:
+        with self._request_lock:
+            if self._closed:
+                raise ApiError("Haven client is closed")
+            self._gate.raise_if_blocked()
+            if auth_required and not self.is_authenticated:
+                raise AuthenticationError("Authentication required")
+            if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+                raise ApiError("Invalid Haven API request path")
+            if timeout is None:
+                request_timeout = self._api_config.timeout
+            elif (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout)
+                or timeout <= 0
+            ):
+                raise ValueError("timeout must be a finite positive number")
+            else:
+                request_timeout = (min(self._api_config.connect_timeout, timeout), timeout)
 
-        # This is the only sleep: a short gap between outbound requests. Long
-        # server cooldowns above return an error immediately instead of sleeping.
-        delay = self._next_request_at - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
-        self._raise_if_rate_limited()
-        self._next_request_at = time.monotonic() + self._min_request_interval
-            
-        base_url = PROD_API_BASE if use_prod_api else AUTH_API_BASE
-        url = f"{base_url}{path}"
-        
-        # Manage Headers
-        headers = dict(kwargs.pop("headers", {}) or {})
-        
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
-        
-        if "User-Agent" not in headers:
-             headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        headers["Content-Type"] = "application/json"
-        headers["Accept"] = "application/json"
-        
-        kwargs["headers"] = headers
-            
-        try:
-            response = requests.request(method, url, timeout=timeout, **kwargs)
+            base_url = (
+                self._api_config.data_base_url if use_prod_api
+                else self._api_config.auth_base_url
+            )
+            headers = requests.structures.CaseInsensitiveDict(
+                kwargs.pop("headers", {}) or {}
+            )
+            if auth_required and self._token:
+                headers["Authorization"] = f"Bearer {self._token}"
+            else:
+                headers.pop("Authorization", None)
+            headers.setdefault("User-Agent", self._api_config.user_agent)
+            headers["Content-Type"] = "application/json"
+            headers["Accept"] = "application/json"
+            kwargs["headers"] = headers
+            # Never let a redirect forward a login body or bypass our gate.
+            kwargs["allow_redirects"] = False
+            kwargs["stream"] = False
 
-            rate_limit = response.headers.get("X-RateLimit-Limit")
-            rate_remaining = response.headers.get("X-RateLimit-Remaining")
-            retry_after = response.headers.get("Retry-After")
-            if rate_limit or rate_remaining or retry_after:
-                logger.debug(
-                    "Rate-limit headers for %s %s -> limit=%s remaining=%s retry_after=%s",
-                    method,
-                    path,
-                    rate_limit,
-                    rate_remaining,
-                    retry_after,
+            self._gate.before_request()
+            response = None
+            try:
+                response = self._session.request(
+                    method, f"{base_url}{path}", timeout=request_timeout, **kwargs
                 )
-            
-            if response.status_code == 401:
-                self._consecutive_successes = 0
-                raise AuthenticationError("Received 401 Unauthorized response")
+                status = response.status_code
+                retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
 
-            if response.status_code == 429:
-                retry_after_seconds = self._parse_retry_after(retry_after)
-                cooldown = self._record_rate_limit(retry_after_seconds)
-                raise ApiError(
-                    "Received 429 Too Many Requests response",
-                    code=429,
-                    retry_after=cooldown,
-                )
-            
-            response.raise_for_status()
-            
-            if response.status_code == 204:
-                self._record_success()
-                return {}
-                
-            data = response.json()
-            self._record_success()
-            return data
-            
-        except requests.exceptions.RequestException as e:
-            self._consecutive_successes = 0
-            logger.error("Request failed: %s", str(e))
-            status = response.status_code if 'response' in locals() else None
-            raise ApiError(f"Request failed: {str(e)}", code=status) from e
+                if 300 <= status < 400:
+                    self._gate.record_error()
+                    raise ApiError("Unexpected redirect from Haven API", code=status)
+                if status == 401:
+                    self._gate.record_error()
+                    raise AuthenticationError("Received 401 Unauthorized response")
+                if status == 429:
+                    cooldown = self._gate.record_rate_limit(retry_after)
+                    logger.warning("Haven API rate limited; requests paused for %ss", cooldown)
+                    raise ApiError(
+                        "Received 429 Too Many Requests response",
+                        code=429,
+                        retry_after=cooldown,
+                    )
+                if status == 503 and retry_after is not None:
+                    cooldown = self._gate.record_service_unavailable(retry_after)
+                    logger.warning("Haven API unavailable; requests paused for %ss", cooldown)
+                    raise ApiError(
+                        "Received 503 Service Unavailable response",
+                        code=503,
+                        retry_after=cooldown,
+                    )
+
+                response.raise_for_status()
+                data = {} if status == 204 else response.json()
+                self._gate.record_success()
+                return data
+            except requests.exceptions.RequestException as error:
+                self._gate.record_error()
+                status = response.status_code if response is not None else None
+                raise ApiError(f"Request failed: {error}", code=status) from error
+            finally:
+                if response is not None:
+                    response.close()

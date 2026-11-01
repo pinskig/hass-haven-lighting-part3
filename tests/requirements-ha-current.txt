@@ -1,0 +1,3 @@
+# Exact supported current release, verified against PyPI on 2026-10-31.
+homeassistant==2026.10.4
+pytest-homeassistant-custom-component==0.13.375

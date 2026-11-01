@@ -6,5 +6,6 @@
   "documentation": "https://github.com/pinskig/hass-haven-lighting-part3",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/pinskig/hass-haven-lighting-part3/issues",
-  "version": "1.0.6"
+  "requirements": ["requests>=2.31,<3"],
+  "version": "1.0.7"
 }

@@ -1,7 +1,6 @@
 """Platform for Haven light integration."""
 from __future__ import annotations
 import logging
-import math
 from typing import Any
 
 from homeassistant.components.light import (
@@ -16,7 +15,6 @@ from homeassistant.components.light import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo
@@ -24,7 +22,13 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import HavenCoordinator
-from .havenlighting.exceptions import ApiError, AuthenticationError
+from .havenlighting.models import LightState, TargetKey
+from .registry import async_prepare_registries, entity_unique_id
+
+try:
+    from homeassistant.components.light import EFFECT_OFF
+except ImportError:  # Home Assistant 2024.1 predates this convenience constant.
+    EFFECT_OFF = "off"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,120 +68,93 @@ HAVEN_EFFECT_MAP = {
     "Ocean": 24
 }
 
+KELVIN_BY_ID = {color_id: kelvin for kelvin, color_id in HAVEN_KELVIN_MAP.items()}
+RGB_BY_ID = {color_id: rgb for rgb, color_id in HAVEN_RGB_MAP.items()}
+EFFECT_BY_ID = {color_id: effect for effect, color_id in HAVEN_EFFECT_MAP.items()}
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Haven Light from a config entry."""
+    """Add newly discovered targets while retaining missing registry entries."""
     coordinators: list[HavenCoordinator] = hass.data[DOMAIN][config_entry.entry_id]["coordinators"]
     if not coordinators:
         return
-        
-    # FIX 2: Register the "Location" device first to stop the "via_device" warning
-    device_registry = dr.async_get(hass)
+
+    warned: set[str] = set()
+    async_prepare_registries(hass, config_entry, coordinators, warned)
+
+    def watch_inventory(coordinator: HavenCoordinator) -> None:
+        known: set[TargetKey] = set()
+
+        @callback
+        def add_new_entities() -> None:
+            if not coordinator.last_update_success:
+                return
+            current = coordinator.data or {}
+            added = current.keys() - known
+            if not added:
+                return
+            # Reappearing legacy targets can be migrated when they are first
+            # observed, even if the initial inventory was empty or incomplete.
+            async_prepare_registries(hass, config_entry, coordinators, warned)
+            keys = sorted(added, key=lambda key: (key.kind, key.remote_id))
+            entities = [HavenLight(key, coordinator) for key in keys]
+            known.update(keys)
+            async_add_entities(entities)
+
+        config_entry.async_on_unload(coordinator.async_add_listener(add_new_entities))
+        add_new_entities()
+
     for coordinator in coordinators:
-        location = coordinator.location
-        loc_id = location.location_id
-        device_registry.async_get_or_create(
-            config_entry_id=config_entry.entry_id,
-            identifiers={(DOMAIN, str(loc_id))},
-            manufacturer="Haven",
-            name=location.name,
-            model="Haven Controller/Location",
-        )
-
-    entities = []
-    found_entity_ids = set()
-    found_device_ids = set()
-
-    for coordinator in coordinators:
-        lights = coordinator.data
-        if lights:
-            for light in lights.values():
-                entity = HavenLight(light, coordinator)
-                entities.append(entity)
-                found_entity_ids.add(entity.unique_id)
-                found_device_ids.add(str(light.id))
-
-    async_add_entities(entities)
-    
-    await _async_cleanup_dead_items(hass, config_entry, found_entity_ids, found_device_ids)
-
-async def _async_cleanup_dead_items(hass: HomeAssistant, config_entry: ConfigEntry, found_entity_ids: set[str], found_device_ids: set[str]):
-    """Remove entities and devices that are no longer returned by the API."""
-    ent_reg = er.async_get(hass)
-    entries = er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
-    for entry in entries:
-        if entry.unique_id not in found_entity_ids:
-            _LOGGER.info("Removing dead entity: %s", entry.entity_id)
-            ent_reg.async_remove(entry.entity_id)
-
-    dev_reg = dr.async_get(hass)
-    devices = dr.async_entries_for_config_entry(dev_reg, config_entry.entry_id)
-    for device in devices:
-        # Skip the Location device (it won't be in the light list)
-        is_location = False
-        for domain, device_id in device.identifiers:
-             if domain == DOMAIN and device_id not in found_device_ids:
-                 # Crude check: if the ID is short (5 digits like 28513) it's likely the location, keep it.
-                 # Lights are usually longer (6 digits like 801348 or 79633)
-                 if len(str(device_id)) < 6: 
-                     is_location = True
-                     continue
-                 
-                 if not is_location:
-                    _LOGGER.info("Removing dead device: %s", device_id)
-                    dev_reg.async_remove_device(device.id)
-                    break
+        watch_inventory(coordinator)
 
 class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
     """Representation of a Haven Light."""
 
     _attr_has_entity_name = True
-    
-    # FIX 1: Removed ColorMode.BRIGHTNESS to stop the "invalid color modes" warning
+    _attr_name = None
+
     _attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP}
-    
+
     _attr_supported_features = LightEntityFeature.EFFECT
-    _attr_effect_list = list(HAVEN_EFFECT_MAP.keys())
+    _attr_effect_list = [*HAVEN_EFFECT_MAP, EFFECT_OFF]
     _attr_min_color_temp_kelvin = 2700
     _attr_max_color_temp_kelvin = 5000
 
-    def __init__(self, light, coordinator: HavenCoordinator) -> None:
+    def __init__(self, key: TargetKey, coordinator: HavenCoordinator) -> None:
         """Initialize a Haven Light."""
         super().__init__(coordinator)
-        self._light = light
-        self._location = coordinator.location
-        self._attr_unique_id = f"haven_light_{light.id}"
-        self._attr_name = light.name
+        self._key = key
+        self._last_state = coordinator.data[key]
+        self._attr_unique_id = entity_unique_id(coordinator.account_id, key)
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, str(light.id))},
-            name=light.name,
+            identifiers={(DOMAIN, self._attr_unique_id)},
+            name=self._last_state.name,
             manufacturer="Haven",
-            model=f"Haven {light._type}",
-            # Now safe to reference because we created it in setup
-            via_device=(DOMAIN, str(self._location.location_id)),
+            model=f"Haven {key.kind}",
         )
 
     @property
     def available(self) -> bool:
-        return super().available and self._light.id in (self.coordinator.data or {})
+        return super().available and self._key in (self.coordinator.data or {})
+
+    @property
+    def _state(self) -> LightState:
+        return (self.coordinator.data or {}).get(self._key, self._last_state)
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        if updated := (self.coordinator.data or {}).get(self._light.id):
-            self._light = updated
+        if updated := (self.coordinator.data or {}).get(self._key):
+            if updated.name != self._last_state.name:
+                self._attr_device_info = {**self._attr_device_info, "name": updated.name}
+                if self.registry_entry is not None and self.registry_entry.device_id:
+                    dr.async_get(self.hass).async_update_device(
+                        self.registry_entry.device_id, name=updated.name
+                    )
+            self._last_state = updated
         super()._handle_coordinator_update()
-
-    async def _async_send_command(self, command, *args) -> None:
-        """Report rejected commands and batch successful commands' state refresh."""
-        try:
-            await self.hass.async_add_executor_job(command, *args)
-        except (ApiError, AuthenticationError) as error:
-            raise HomeAssistantError(str(error)) from error
-        self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
 
     @property
     def unique_id(self) -> str:
@@ -185,58 +162,78 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
 
     @property
     def is_on(self) -> bool:
-        return self._light.is_on
+        return self._state.is_on
 
     @property
     def brightness(self) -> int:
-        return self._light.brightness
+        return self._state.brightness
 
     @property
     def color_mode(self) -> ColorMode:
-        # If we are in White mode, report COLOR_TEMP so the UI shows the slider
-        # Otherwise report RGB
-        # (For now, default to RGB to keep it simple as HA handles the switch well)
-        return ColorMode.RGB
+        if self._state.color_id in KELVIN_BY_ID:
+            return ColorMode.COLOR_TEMP
+        if self._state.color_id in RGB_BY_ID:
+            return ColorMode.RGB
+        return ColorMode.UNKNOWN
+
+    @property
+    def color_temp_kelvin(self) -> int | None:
+        return KELVIN_BY_ID.get(self._state.color_id)
+
+    @property
+    def rgb_color(self) -> tuple[int, int, int] | None:
+        return RGB_BY_ID.get(self._state.color_id)
+
+    @property
+    def effect(self) -> str | None:
+        color_id = self._state.color_id
+        if color_id in EFFECT_BY_ID:
+            return EFFECT_BY_ID[color_id]
+        if color_id in KELVIN_BY_ID or color_id in RGB_BY_ID:
+            return EFFECT_OFF
+        return None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
+        commands: list[tuple[str, tuple]] = []
         if ATTR_BRIGHTNESS in kwargs:
-            ha_brightness = kwargs[ATTR_BRIGHTNESS]
-            haven_brightness = round(ha_brightness / 25.5)
-            if haven_brightness == 0: haven_brightness = 1
-            await self._async_send_command(self._light.set_brightness, haven_brightness)
-
-        if ATTR_EFFECT in kwargs:
-            effect_name = kwargs[ATTR_EFFECT]
-            if effect_name in HAVEN_EFFECT_MAP:
-                await self._async_send_command(self._light.set_color, HAVEN_EFFECT_MAP[effect_name])
+            brightness = kwargs[ATTR_BRIGHTNESS]
+            if brightness == 0:
+                await self.async_turn_off()
                 return
+            commands.append(("set_brightness", (max(1, round(brightness / 25.5)),)))
 
-        if ATTR_COLOR_TEMP_KELVIN in kwargs:
+        color_id = None
+        effect = kwargs.get(ATTR_EFFECT)
+        if effect is not None and effect != EFFECT_OFF:
+            if effect not in HAVEN_EFFECT_MAP:
+                raise HomeAssistantError(f"Unknown Haven effect: {effect}")
+            color_id = HAVEN_EFFECT_MAP[effect]
+        elif ATTR_COLOR_TEMP_KELVIN in kwargs:
             kelvin = kwargs[ATTR_COLOR_TEMP_KELVIN]
-            closest_id = min(HAVEN_KELVIN_MAP.items(), key=lambda x: abs(x[0] - kelvin))[1]
-            await self._async_send_command(self._light.set_color, closest_id)
-            return
+            color_id = min(HAVEN_KELVIN_MAP, key=lambda value: abs(value - kelvin))
+            color_id = HAVEN_KELVIN_MAP[color_id]
+        elif ATTR_RGB_COLOR in kwargs:
+            color_id = self._find_closest_color_id(*kwargs[ATTR_RGB_COLOR])
+        elif effect == EFFECT_OFF and self._state.color_id in EFFECT_BY_ID:
+            # A static white preset stops an effect when no replacement color
+            # was supplied. Haven has no separate effect-stop endpoint here.
+            color_id = HAVEN_KELVIN_MAP[2700]
 
-        if ATTR_RGB_COLOR in kwargs:
-            r, g, b = kwargs[ATTR_RGB_COLOR]
-            closest_id = self._find_closest_color_id(r, g, b)
-            await self._async_send_command(self._light.set_color, closest_id)
-            return
-
-        if not kwargs:
-            await self._async_send_command(self._light.turn_on)
+        if color_id is not None:
+            commands.append(("set_color", (color_id,)))
+        if not commands or (ATTR_BRIGHTNESS not in kwargs and not self.is_on):
+            commands.append(("turn_on", ()))
+        await self.coordinator.async_send_commands(self._key, commands)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
-        await self._async_send_command(self._light.turn_off)
+        await self.coordinator.async_send_commands(self._key, [("turn_off", ())])
 
-    def _find_closest_color_id(self, r, g, b):
-        closest_dist = float('inf')
-        closest_id = 24 
-        for color_rgb, color_id in HAVEN_RGB_MAP.items():
-            dist = math.sqrt((r - color_rgb[0]) ** 2 + (g - color_rgb[1]) ** 2 + (b - color_rgb[2]) ** 2)
-            if dist < closest_dist:
-                closest_dist = dist
-                closest_id = color_id
-        return closest_id
+    @staticmethod
+    def _find_closest_color_id(r: int, g: int, b: int) -> int:
+        rgb = min(
+            HAVEN_RGB_MAP,
+            key=lambda value: (r - value[0]) ** 2 + (g - value[1]) ** 2 + (b - value[2]) ** 2,
+        )
+        return HAVEN_RGB_MAP[rgb]

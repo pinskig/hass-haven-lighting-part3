@@ -1,6 +1,6 @@
 """Offline regressions for Haven's shared request budget and location refreshes.
 
-Every HTTP request is intercepted at requests.request. No credentials or access
+Every HTTP request is intercepted at requests.Session.request. No credentials or access
 to a Haven account are needed. The library is imported independently of Home
 Assistant so these tests also run on an ordinary Python installation.
 """
@@ -21,11 +21,13 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "custom_components" / "haven"))
 
 from havenlighting import credentials as credentials_module
+from havenlighting import request_gate as request_gate_module
 from havenlighting.credentials import Credentials
 from havenlighting.devices import location as location_module
 from havenlighting.devices.light import Light
 from havenlighting.devices.location import Location
 from havenlighting.exceptions import ApiError
+from havenlighting.models import TargetKey
 
 
 class Clock:
@@ -80,6 +82,7 @@ def response(status: int = 200, data=None, headers=None) -> requests.Response:
     result.url = "https://example.invalid/haven-test"
     result.headers.update(headers or {})
     result._content = json.dumps({} if data is None else data).encode("utf-8")
+    result._content_consumed = True
     result.encoding = "utf-8"
     return result
 
@@ -97,21 +100,25 @@ def group(group_id: int = 202, *, is_on: bool = True) -> dict:
 class OfflineHavenTest(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = Clock()
-        for module in (credentials_module, location_module):
+        for module in (credentials_module, request_gate_module, location_module):
             timer = patch.object(module, "time", self.clock)
             timer.start()
             self.addCleanup(timer.stop)
 
-        network = patch.object(requests, "request")
+        network = patch.object(requests.Session, "request")
         self.request = network.start()
         self.addCleanup(network.stop)
         self.request.side_effect = AssertionError("Unexpected HTTP request in offline test")
 
         self.credentials = Credentials(min_request_interval=0.0)
+        self.addCleanup(self.credentials.close)
         self.credentials._update_credentials(
             {"token": "old-token", "refreshToken": "test-refresh-token", "id": 1}
         )
         self.location = Location(self.credentials, 12345, {"name": "Test location"})
+        self.zone_key = TargetKey(12345, "Zone", 101)
+        self.group_key = TargetKey(12345, "Group", 202)
+        self.target_keys = {self.zone_key, self.group_key}
 
     @staticmethod
     def location_response(method: str, url: str, **kwargs) -> requests.Response:
@@ -161,7 +168,8 @@ class LocationRefreshTests(OfflineHavenTest):
                 future.result(timeout=3)
 
         self.assertEqual(self.request.call_count, 2)
-        self.assertEqual(set(self.location.get_lights()), {101, 202})
+        self.assertEqual(set(self.location.get_lights()), self.target_keys)
+        self.assertEqual(self.location.snapshot[self.zone_key].brightness, 128)
 
     def test_overlapping_forced_refreshes_share_the_inflight_result(self) -> None:
         observed = ObservedLock(8)
@@ -242,7 +250,7 @@ class LocationRefreshTests(OfflineHavenTest):
             self.location.refresh_devices()
 
         preserved = self.location.get_lights()
-        self.assertEqual(set(preserved), {101, 202})
+        self.assertEqual(set(preserved), self.target_keys)
         for light_id in preserved:
             self.assertIs(preserved[light_id], original[light_id])
             self.assertTrue(preserved[light_id].is_on)
@@ -277,7 +285,7 @@ class LocationRefreshTests(OfflineHavenTest):
                     self.location.refresh_devices(force=True)
                 self.assertEqual(self.request.call_count, previous_calls + 1)
                 preserved = self.location.get_lights()
-                self.assertEqual(set(preserved), {101, 202})
+                self.assertEqual(set(preserved), self.target_keys)
                 for light_id in preserved:
                     self.assertIs(preserved[light_id], original[light_id])
                     self.assertTrue(preserved[light_id].is_on)
@@ -319,6 +327,7 @@ class SharedRequestLimitTests(OfflineHavenTest):
 
     def test_default_budget_spaces_outbound_requests_at_least_one_second(self) -> None:
         credentials = Credentials()
+        self.addCleanup(credentials.close)
         credentials._update_credentials({"token": "test-token", "id": 1})
         sent_at = []
 

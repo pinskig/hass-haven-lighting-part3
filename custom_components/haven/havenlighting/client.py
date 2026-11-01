@@ -1,65 +1,66 @@
+"""A Haven API client with explicit transport ownership."""
+
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Optional
+
+from .config import ApiConfig
 from .credentials import Credentials
-from .devices.light import Light
 from .devices.location import Location
-from .exceptions import AuthenticationError, ApiError
-from .logging import setup_logging
+from .exceptions import AuthenticationError
+from .request_gate import RequestGate
 
 logger = logging.getLogger(__name__)
 
+
 class HavenClient:
-    """Main client for interacting with Haven Lighting devices."""
-    
-    def __init__(self, log_level: int = logging.INFO, log_file: Optional[str] = None) -> None:
+    """Expose account discovery while retaining a shared provider request gate."""
+
+    def __init__(
+        self,
+        log_level: int = logging.INFO,
+        log_file: Optional[str] = None,
+        *,
+        request_gate: RequestGate | None = None,
+        api_config: ApiConfig | None = None,
+    ) -> None:
+        """Create a client without changing the host application's logging.
+
+        Legacy log_level/log_file arguments are retained for compatibility.
+        Standalone applications can call logging.setup_logging explicitly.
         """
-        Initialize the Haven Lighting client.
-        
-        Args:
-            log_level: Logging level (default: INFO)
-            log_file: Optional file path for logging output
-        """
-        setup_logging(log_level, log_file)
-        self._credentials = Credentials()
+        self._credentials = Credentials(request_gate=request_gate, api_config=api_config)
         self._locations: Dict[int, Location] = {}
-        self._lights: Dict[int, Light] = {}
-        logger.debug("Initialized HavenClient")
 
     @property
     def is_authenticated(self) -> bool:
-        """Whether this client already holds credentials for setup retries."""
         return self._credentials.is_authenticated
 
+    @property
+    def account_id(self) -> str | None:
+        """Return Haven's stable account ID for entity/device namespacing."""
+        return self._credentials.account_id
+
+    @property
+    def request_gate(self) -> RequestGate:
+        return self._credentials.request_gate
+
+    @property
+    def closed(self) -> bool:
+        return self._credentials.closed
+
     def authenticate(self, email: str, password: str) -> bool:
-        """
-        Authenticate with the Haven Lighting service.
-        
-        Args:
-            email: User's email address
-            password: User's password
-            
-        Returns:
-            bool: True if authentication successful, False otherwise
-            
-        Raises:
-            ApiError: If API request fails
-        """
-        try:
-            authenticated = self._credentials.authenticate(email, password)
-            if authenticated:
-                logger.info("Successfully authenticated user: %s", email)
-            else:
-                logger.warning("Authentication failed for user: %s", email)
-            return authenticated
-        except ApiError as e:
-            logger.error("API error during authentication: %s", str(e))
-            raise
+        return self._credentials.authenticate(email, password)
 
     def discover_locations(self) -> Dict[int, Location]:
-        """Discover all available locations."""
-        if not self._credentials:
+        if not self.is_authenticated:
             raise AuthenticationError("Not authenticated")
-            
-        locations = Location.discover(self._credentials)
-        self._locations.update(locations)
-        return self._locations 
+        discovered = Location.discover(self._credentials)
+        self._locations = {
+            location_id: self._locations.get(location_id, location)
+            for location_id, location in discovered.items()
+        }
+        return self._locations.copy()
+
+    def close(self) -> None:
+        """Close this client's session, retaining the independently owned gate."""
+        self._credentials.close()

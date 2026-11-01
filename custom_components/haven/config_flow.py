@@ -14,6 +14,7 @@ from homeassistant.data_entry_flow import FlowResult
 from .const import DOMAIN
 from .havenlighting import HavenClient
 from .havenlighting.exceptions import ApiError, AuthenticationError
+from .runtime import async_get_account_store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,14 +26,16 @@ class HavenConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def __init__(self) -> None:
         super().__init__()
-        # Form resubmission must retain the client's rate-limit cooldown.
-        self._client = HavenClient()
         self._reauth_entry: config_entries.ConfigEntry | None = None
 
     async def _async_authenticate(self, data: dict[str, Any]) -> dict[str, str]:
+        accounts = await async_get_account_store(self.hass)
+        gate = await accounts.async_get_gate(data[CONF_EMAIL])
+        client = HavenClient(request_gate=gate)
+        accounts.track_client(client)
         try:
             authenticated = await self.hass.async_add_executor_job(
-                self._client.authenticate, data[CONF_EMAIL], data[CONF_PASSWORD]
+                client.authenticate, data[CONF_EMAIL], data[CONF_PASSWORD]
             )
             return {} if authenticated else {"base": "invalid_auth"}
         except AuthenticationError:
@@ -43,6 +46,11 @@ class HavenConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception:
             _LOGGER.exception("Unexpected Haven setup error")
             return {"base": "unknown"}
+        finally:
+            # Every flow outcome closes its pool. Its account budget survives
+            # resubmission, a new flow, reload, and process restart.
+            await accounts.async_close_client(client)
+            await accounts.async_flush()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None

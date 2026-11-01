@@ -1,0 +1,5 @@
+# The first January 2024 fixture release was generated for HA 2024.1.2.
+# Install with requirements-ha-min-overrides.txt to test the promised 2024.1.0
+# floor itself. The override is intentional; all tests execute real HA 2024.1.0.
+homeassistant==2024.1.0
+pytest-homeassistant-custom-component==0.13.88
