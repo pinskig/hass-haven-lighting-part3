@@ -19,6 +19,25 @@ from .request_gate import RequestGate
 logger = logging.getLogger(__name__)
 
 
+def _request_endpoint_family(path: str) -> str:
+    """Return a fixed diagnostic label, never caller-supplied identifiers."""
+    path = path.partition("?")[0].partition("#")[0]
+    for family in (
+        "/Auth/Authenticate",
+        "/Auth/Refresh",
+        "/user/GetUserInfo",
+        "/LightAndZones/OrderedList",
+        "/Group/AllGroupsByLocation",
+        "/Commands/On",
+        "/Commands/Off",
+        "/Commands/Brightness",
+        "/Commands/SetColor",
+    ):
+        if path == family or path.startswith(f"{family}/"):
+            return family
+    return "other"
+
+
 class _ExplicitAuthorization(requests.auth.AuthBase):
     """Keep the caller's Authorization header authoritative over ambient netrc."""
 
@@ -119,7 +138,7 @@ class Credentials:
                 deadline = deadline.replace(tzinfo=timezone.utc)
             return max(0, math.ceil(deadline.timestamp() - time.time()))
         except (TypeError, ValueError, OverflowError):
-            logger.debug("Unable to parse Retry-After header value: %s", value)
+            logger.debug("Unable to parse Retry-After header")
             return None
 
     def authenticate(self, email: str, password: str) -> bool:
@@ -261,9 +280,24 @@ class Credentials:
             self._gate.before_request()
             response = None
             try:
-                response = self._session.request(
-                    method, f"{base_url}{path}", timeout=request_timeout, **kwargs
-                )
+                # Count transport attempts, not local cooldown rejections. A
+                # connection failure does not prove the request reached Haven.
+                started = time.monotonic()
+                try:
+                    response = self._session.request(
+                        method, f"{base_url}{path}", timeout=request_timeout, **kwargs
+                    )
+                finally:
+                    log_method = method.upper() if isinstance(method, str) else "OTHER"
+                    if log_method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+                        log_method = "OTHER"
+                    logger.debug(
+                        "Haven HTTP attempt: method=%s endpoint=%s status=%s elapsed=%.3fs",
+                        log_method,
+                        _request_endpoint_family(path),
+                        response.status_code if response is not None else "request_failed",
+                        time.monotonic() - started,
+                    )
                 status = response.status_code
                 retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
 

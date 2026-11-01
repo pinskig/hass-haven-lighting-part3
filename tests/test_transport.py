@@ -282,6 +282,128 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.sent[0][1].headers["Authorization"], "Bearer audit-token")
         netrc.assert_not_called()
 
+    def test_debug_counts_each_attempt_and_excludes_pacing_from_elapsed(self):
+        credentials = self.credentials(RequestGate(min_request_interval=1))
+
+        def send(adapter, request, **kwargs):
+            self.sent.append((adapter, request, kwargs, self.clock.monotonic()))
+            self.clock.advance(0.25)
+            return self.response(request)
+
+        with patch.object(requests.adapters.HTTPAdapter, "send", new=send), \
+                self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
+            credentials.make_request("GET", "/LightAndZones/OrderedList/987654")
+            credentials.make_request("GET", "/Group/AllGroupsByLocation/987654")
+
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.sent[1][3] - self.sent[0][3], 1)
+        self.assertEqual([record.getMessage() for record in captured.records], [
+            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.250s",
+            "Haven HTTP attempt: method=GET endpoint=/Group/AllGroupsByLocation status=200 elapsed=0.250s",
+        ])
+
+    def test_debug_counts_401_refresh_and_retry_as_three_attempts(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        self.replies.extend([
+            (401, {}, {}),
+            (200, {"token": "replacement-token", "refreshToken": "replacement-refresh", "id": 123}, {}),
+            (200, {}, {}),
+        ])
+        with self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
+            credentials.make_request("GET", "/LightAndZones/OrderedList/987654")
+
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual([record.getMessage() for record in captured.records], [
+            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=401 elapsed=0.000s",
+            "Haven HTTP attempt: method=POST endpoint=/Auth/Refresh status=200 elapsed=0.000s",
+            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.000s",
+        ])
+        for secret in ("audit-token", "audit-refresh", "replacement-token", "replacement-refresh", "987654"):
+            self.assertNotIn(secret, "\n".join(captured.output))
+
+    def test_debug_counts_timeout_once_without_exception_details(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+
+        def send(adapter, request, **kwargs):
+            self.sent.append((adapter, request, kwargs, self.clock.monotonic()))
+            self.clock.advance(0.5)
+            raise requests.exceptions.Timeout("PRIVATE_EXCEPTION_DETAIL")
+
+        with patch.object(requests.adapters.HTTPAdapter, "send", new=send), \
+                self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
+            with self.assertRaises(ApiError):
+                credentials.make_request("POST", "/Commands/Off", json={"id": 987654})
+
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual([record.getMessage() for record in captured.records], [
+            "Haven HTTP attempt: method=POST endpoint=/Commands/Off status=request_failed elapsed=0.500s",
+        ])
+        self.assertNotIn("PRIVATE_EXCEPTION_DETAIL", "\n".join(captured.output))
+
+    def test_debug_does_not_count_local_cooldown_rejections(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        self.replies.append((429, {}, {"Retry-After": "3600"}))
+        with self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
+            with self.assertRaises(ApiError):
+                credentials.make_request("GET", "/LightAndZones/OrderedList/987654")
+        attempts = [record for record in captured.records if record.getMessage().startswith("Haven HTTP attempt:")]
+        self.assertEqual(len(attempts), 1)
+        self.assertIn("status=429", attempts[0].getMessage())
+
+        operations = (
+            lambda: credentials.authenticate("audit@example.invalid", "DUMMY_PASSWORD"),
+            credentials.refresh_token,
+            lambda: credentials.make_request("GET", "/LightAndZones/OrderedList/987654"),
+            lambda: credentials.make_request("POST", "/Commands/On", json={"id": 987654}),
+        )
+        with self.assertNoLogs(credentials_module.logger, level="DEBUG"):
+            for operation in operations:
+                with self.assertRaises(ApiError) as blocked:
+                    operation()
+                self.assertTrue(blocked.exception.rate_limited_locally)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_debug_excludes_secrets_urls_identifiers_and_arbitrary_paths(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        self.replies.extend([
+            (200, {"token": "PRIVATE_ACCESS_TOKEN", "refreshToken": "PRIVATE_REFRESH_TOKEN", "id": 123}, {}),
+            (200, {"private": "PRIVATE_RESPONSE_BODY"}, {"Retry-After": "PRIVATE_RESPONSE_HEADER"}),
+            (200, {}, {}),
+            (200, {}, {}),
+        ])
+        with self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
+            credentials.authenticate("private-email@example.invalid", "PRIVATE_PASSWORD")
+            credentials.make_request(
+                "GET", "/LightAndZones/OrderedList/987654?token=PRIVATE_QUERY#PRIVATE_FRAGMENT",
+                headers={"X-Private": "PRIVATE_REQUEST_HEADER"},
+            )
+            credentials.make_request(
+                "POST", "/Commands/SetColor",
+                json={"id": 987654, "colorId": 11, "private": "PRIVATE_REQUEST_BODY"},
+            )
+            credentials.make_request("PRIVATE_METHOD", "/PRIVATE_PATH/987654?token=PRIVATE_QUERY")
+
+        output = "\n".join(captured.output)
+        for secret in (
+            "PRIVATE_", "private-email@example.invalid", "987654", "Bearer",
+            "stg-api.havenlighting.com", credentials._session_device_id,
+        ):
+            self.assertNotIn(secret, output)
+        attempts = [record.getMessage() for record in captured.records if record.getMessage().startswith("Haven HTTP attempt:")]
+        self.assertEqual(len(attempts), len(self.sent))
+        self.assertEqual(len(attempts), 4)
+        self.assertIn("method=POST endpoint=/Auth/Authenticate", attempts[0])
+        self.assertIn("method=GET endpoint=/LightAndZones/OrderedList", attempts[1])
+        self.assertIn("method=POST endpoint=/Commands/SetColor", attempts[2])
+        self.assertIn("method=OTHER endpoint=other", attempts[3])
+
+    def test_successful_attempt_logging_is_debug_only(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        self.replies.append((200, {}, {}))
+        with self.assertNoLogs(credentials_module.logger, level="INFO"):
+            credentials.make_request("GET", "/user/GetUserInfo")
+        self.assertEqual(len(self.sent), 1)
+
     def test_clients_do_not_change_logging_handlers(self):
         package_logger = logging.getLogger("havenlighting")
         before = list(package_logger.handlers)

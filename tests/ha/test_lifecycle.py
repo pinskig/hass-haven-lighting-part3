@@ -2,6 +2,8 @@
 
 from datetime import timedelta
 
+import pytest
+
 from homeassistant import config_entries
 from homeassistant.helpers.debounce import Debouncer
 from homeassistant.util import dt as dt_util
@@ -48,6 +50,56 @@ async def test_color_only_turn_on_explicitly_powers_an_off_light(
     assert "/Commands/SetColor" in commands
     assert hass.states.get(entity_id).state == "on"
     assert hass.states.get(entity_id).attributes["rgb_color"] == (0, 0, 255)
+
+
+@pytest.mark.parametrize(
+    ("parameters", "color_id"),
+    [
+        ({"rgb_color": (0, 0, 255)}, 25),
+        ({"color_temp_kelvin": 3500}, 3),
+        ({"effect": "Fire"}, 12),
+    ],
+)
+async def test_color_turn_on_powers_device_despite_stale_cached_on_state(
+    hass, loaded_entry, haven_api, parameters, color_id
+):
+    coordinator = hass.data["haven"][loaded_entry.entry_id]["coordinators"][0]
+    haven_api.zones[0]["isOn"] = True
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    entity_id = entity_for(hass)
+    assert hass.states.get(entity_id).state == "on"
+
+    # The app or a schedule switches it off between coordinator polls.
+    haven_api.zones[0]["isOn"] = False
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id, **parameters}, blocking=True
+    )
+    assert haven_api.zones[0]["isOn"] is True
+    assert haven_api.zones[0]["colorId"] == color_id
+    assert [call[1] for call in haven_api.command_calls] == [
+        "/Commands/SetColor", "/Commands/On"
+    ]
+    assert hass.states.get(entity_id).state == "on"
+
+    # Confirm the requested power persists when optimistic state is refreshed.
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == "on"
+
+
+@pytest.mark.parametrize("brightness", [128, 0])
+async def test_brightness_power_actions_do_not_add_redundant_on(
+    hass, loaded_entry, haven_api, brightness
+):
+    entity_id = entity_for(hass)
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id, "brightness": brightness}, blocking=True
+    )
+    expected = "/Commands/Brightness" if brightness else "/Commands/Off"
+    assert [call[1] for call in haven_api.command_calls] == [expected]
+    assert haven_api.zones[0]["isOn"] is bool(brightness)
+    assert hass.states.get(entity_id).state == ("on" if brightness else "off")
 
 
 async def test_unload_closes_client_cancels_timers_and_retains_account_budget(

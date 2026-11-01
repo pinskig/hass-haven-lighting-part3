@@ -174,6 +174,8 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
             return ColorMode.COLOR_TEMP
         if self._state.color_id in RGB_BY_ID:
             return ColorMode.RGB
+        if self._state.color_id in EFFECT_BY_ID:
+            return ColorMode.BRIGHTNESS
         return ColorMode.UNKNOWN
 
     @property
@@ -222,7 +224,9 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
 
         if color_id is not None:
             commands.append(("set_color", (color_id,)))
-        if not commands or (ATTR_BRIGHTNESS not in kwargs and not self.is_on):
+        # Cached power can lag the app or a schedule. Brightness implies on;
+        # other turn_on requests must explicitly power the target on.
+        if ATTR_BRIGHTNESS not in kwargs:
             commands.append(("turn_on", ()))
         await self.coordinator.async_send_commands(self._key, commands)
 

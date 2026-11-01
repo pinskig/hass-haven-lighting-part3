@@ -191,6 +191,7 @@ class LightEntity:
 class ColorMode(str, Enum):
     RGB = "rgb"
     COLOR_TEMP = "color_temp"
+    BRIGHTNESS = "brightness"
     UNKNOWN = "unknown"
 
 

@@ -50,7 +50,7 @@ async def test_same_number_zone_and_group_get_distinct_entities(
     assert haven_api.zones[0]["isOn"] is False
 
 
-async def test_color_and_effect_state_follow_server_snapshot(
+async def test_color_state_follows_server_snapshot(
     hass, loaded_entry, haven_api
 ):
     coordinator = hass.data["haven"][loaded_entry.entry_id]["coordinators"][0]
@@ -68,10 +68,49 @@ async def test_color_and_effect_state_follow_server_snapshot(
     assert state.attributes["color_mode"] == "rgb"
     assert state.attributes["rgb_color"] == (0, 0, 255)
 
-    haven_api.zones[0]["colorId"] = 12
+
+@pytest.mark.parametrize(
+    ("color_id", "effect"), [(12, "Fire"), (17, "Sunset"), (24, "Ocean")]
+)
+async def test_effect_state_preserves_brightness(
+    hass, loaded_entry, haven_api, color_id, effect
+):
+    coordinator = hass.data["haven"][loaded_entry.entry_id]["coordinators"][0]
+    haven_api.zones[0].update(isOn=True, lightBrightnessId=5, colorId=color_id)
     await coordinator.async_refresh()
     await hass.async_block_till_done()
-    assert hass.states.get(entity_for(hass)).attributes["effect"] == "Fire"
+    state = hass.states.get(entity_for(hass))
+    assert state.attributes["effect"] == effect
+    assert state.attributes["color_mode"] == "brightness"
+    assert state.attributes["brightness"] == 128
+    assert state.attributes["rgb_color"] is None
+    assert state.attributes["color_temp_kelvin"] is None
+
+    # A brightness command must keep the effect and its published brightness.
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": state.entity_id, "brightness": 204}, blocking=True
+    )
+    state = hass.states.get(state.entity_id)
+    assert state.attributes["effect"] == effect
+    assert state.attributes["color_mode"] == "brightness"
+    assert state.attributes["brightness"] == 204
+    assert haven_api.zones[0]["colorId"] == color_id
+
+
+@pytest.mark.parametrize("color_id", [None, 999])
+async def test_unmapped_color_state_remains_unknown(
+    hass, loaded_entry, haven_api, color_id
+):
+    coordinator = hass.data["haven"][loaded_entry.entry_id]["coordinators"][0]
+    haven_api.zones[0].update(isOn=True, colorId=color_id)
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    state = hass.states.get(entity_for(hass))
+    assert state.state == "on"
+    assert state.attributes["color_mode"] == "unknown"
+    assert state.attributes["effect"] is None
+    assert state.attributes["rgb_color"] is None
+    assert state.attributes["color_temp_kelvin"] is None
 
 
 async def test_inventory_add_remove_return_and_rename(hass, loaded_entry, haven_api):

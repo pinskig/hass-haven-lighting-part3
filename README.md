@@ -12,7 +12,7 @@ A revived and modernized Home Assistant integration for **Haven Lighting** smart
 - **Safe discovery:** New zones/groups appear automatically. Missing targets become unavailable and retain their registry entries and customization.
 - **Shared polling:** One refresh per location every 60 seconds updates all zone/group entities. Successful commands request a shared refresh after a five-second debounce window.
 - **Account request protection:** Polling, commands, discovery, and authentication share a cooldown and a one-second minimum gap between outbound requests. Provider cooldowns survive setup flows, reloads, and Home Assistant restarts.
-- **Accurate state:** Report RGB, white temperature, and active effects from validated, immutable snapshots; unchanged polls do not cause redundant state writes.
+- **Accurate state:** Report RGB, white temperature, and active effects with brightness from validated, immutable snapshots; unchanged polls do not cause redundant state writes.
 - **Updated auth/API handling:** Modern endpoints and session device-ID behavior for improved login reliability.
 
 ## 🧱 Compatibility
@@ -29,7 +29,7 @@ A revived and modernized Home Assistant integration for **Haven Lighting** smart
 
 ### Updating an existing installation
 
-Download or redownload the latest repository version in HACS, then restart Home Assistant. The integration manifest for this update is **1.0.7**.
+Download or redownload the latest repository version in HACS, then restart Home Assistant. The integration manifest for this update is **1.0.8**.
 
 On first setup, existing registry identities are migrated to account/location/type-specific identifiers. When the old device's kind and parent are known, the migration preserves entity IDs, device IDs, custom names, and area assignments. It also handles a legacy target that first reappears after setup. Ambiguous legacy records are retained and logged for review instead of being assigned to a potentially different target. Existing automations keep their references for targets that migrate successfully.
 
@@ -50,6 +50,8 @@ In Home Assistant automations, advanced color controls are often easiest via a s
 4. Target your Haven entity (for example, `light.front_yard`).
 5. Set fields such as **rgb_color**, **brightness**, or **color_temp_kelvin**.
 
+Color-, temperature-, and effect-only `light.turn_on` actions explicitly request power on, even if the last poll reported the light on. This handles lights switched off through the Haven app or a schedule between polls. It adds one paced request when the light was already on; a brightness command already requests power on.
+
 ## 🛠️ Troubleshooting
 - **Login fails:** Check the credentials. A temporary connection error can also mean a provider cooldown is still active; repeated setup attempts and restarts respect that same deadline.
 - **Entities missing:** Allow the next normal discovery cycle. New targets are added automatically, including after an initially empty inventory. Check the logs if a legacy identity could not be migrated safely.
@@ -58,7 +60,7 @@ In Home Assistant automations, advanced color controls are often easiest via a s
 - **Removed targets:** They remain in the registries and become unavailable. Remove permanently retired devices through Home Assistant when appropriate; discovery does not delete them automatically.
 - **Duplicate account entries:** Setup prevents a second active entry for the same normalized email. Registry conflicts with another entry are reported rather than silently changing its devices.
 - **Unexpected redirect:** Fixed API endpoints reject redirects so login bodies are not forwarded and extra requests cannot bypass pacing. Check the configured API environment if the service has moved.
-- **Need logs:** Enable debug logging for `custom_components.haven` and inspect Home Assistant logs.
+- **Need logs:** Enable debug logging for `custom_components.haven` and inspect Home Assistant logs. Each `Haven HTTP` debug record describes an actual request attempt with its method, endpoint family, response status (or transport failure), and elapsed time. These records omit credentials, tokens, request/response bodies, and target IDs. Calls rejected locally during cooldown produce no HTTP record. A normal location refresh makes two GET requests: one for zones and one for groups.
 
 The API endpoints are defined once in `havenlighting/config.py`. Both defaults remain on the staging host used by this integration's existing account. The persistent Requests session uses separate five-second connection and thirty-second read-inactivity timeouts; these are not a total wall-clock deadline. Session closure does not clear the account budget. Persisted cooldown metadata contains a hashed account key, retry deadline/status, and backoff count; it contains no password or access token.
 
@@ -67,6 +69,7 @@ The API endpoints are defined once in `havenlighting/config.py`. Both defaults r
 To make recent updates easier to track, this section can be updated whenever you ship a change with ChatGPT support.
 
 ### Latest updates
+- **1.0.8:** Make color-, temperature-, and effect-only turn-on actions request power on despite stale cached state. Preserve reported brightness during Fire, Sunset, and Ocean effects. Add debug records for actual HTTP attempts and regression tests for stale state, effect brightness, request accounting, and sensitive-data exclusion.
 - **2026-11-01 — 1.0.7:** Persist shared account cooldowns across flows, reloads, and restarts; honor 503 retry deadlines; pool HTTP connections and reject redirects. Validate API values, separate zone/group identities, migrate known legacy registry entries without changing their IDs, retain unavailable targets, and discover additions automatically. Publish immutable snapshots, correct color/effect state, propagate refresh cancellation, and serialize command batches with polling. Add real Home Assistant tests and a CI matrix for the minimum and current supported versions.
 - **2026-10-31 — 1.0.6:** Centralize location polling; collapse overlapping refreshes; enforce cooldowns across all API endpoints; preserve 429 responses during token renewal; honor full numeric or HTTP-date Retry-After waits; retain cached light identities after failed refreshes; add reauthentication and duplicate-account prevention. Add offline regression tests for concurrency, rate limits, and Home Assistant integration boundaries.
 - Documentation refresh for setup, automation guidance, and troubleshooting.
