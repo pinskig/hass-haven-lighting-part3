@@ -561,9 +561,9 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.sent[1][3] - self.sent[0][3], 1)
         self.assertEqual([record.getMessage() for record in captured.records], [
             "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.250s "
-            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2",
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2 trace=-",
             "Haven HTTP attempt: method=GET endpoint=/Group/AllGroupsByLocation status=200 elapsed=0.250s "
-            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2",
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2 trace=-",
         ])
 
     def test_debug_identifies_loaded_version_and_response_body_size(self):
@@ -617,11 +617,11 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 3)
         self.assertEqual([record.getMessage() for record in captured.records], [
             "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=401 elapsed=0.000s "
-            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2",
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2 trace=-",
             "Haven HTTP attempt: method=POST endpoint=/Auth/Refresh status=200 elapsed=0.000s "
-            f"version={credentials_module.INTEGRATION_VERSION} response_bytes={len(json.dumps(refresh_data).encode())}",
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes={len(json.dumps(refresh_data).encode())} trace=-",
             "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.000s "
-            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2",
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2 trace=-",
         ])
         for secret in ("audit-token", "audit-refresh", "replacement-token", "replacement-refresh", "987654"):
             self.assertNotIn(secret, "\n".join(captured.output))
@@ -642,7 +642,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual([record.getMessage() for record in captured.records], [
             "Haven HTTP attempt: method=POST endpoint=/Commands/Off status=request_failed elapsed=0.500s "
-            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=unavailable",
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=unavailable trace=-",
         ])
         self.assertNotIn("PRIVATE_EXCEPTION_DETAIL", "\n".join(captured.output))
 

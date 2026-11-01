@@ -122,9 +122,14 @@ class Light:
         # over a command that completed while its network requests were pending.
         with self._operation_lock:
             payload = {"id": self.id, "type": self.kind, **values}
-            self._credentials.make_request(
+            response = self._credentials.make_request(
                 "POST", endpoint, json=payload, use_prod_api=True, allow_empty_response=True
             )
+            # Recognize explicit failures without requiring an unverified full
+            # result schema or rejecting successful empty acknowledgments.
+            results = response if isinstance(response, list) else [response]
+            if any(isinstance(result, dict) and result.get("success") is False for result in results):
+                raise ApiError("Haven reported a command failure")
             with self._state_lock:
                 self._state = replace(self._state, **changes)
 

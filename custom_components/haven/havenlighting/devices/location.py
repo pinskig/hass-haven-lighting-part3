@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Any, ClassVar
 
+from ..colors import EFFECT_BY_ID, HAVEN_KELVIN_MAP
 from ..credentials import Credentials
 from ..exceptions import ApiError
 from ..models import LightState, LocationData, TargetKey
@@ -99,7 +100,10 @@ class Location:
         """
         if not isinstance(key, TargetKey) or key.location_id != self._location_id:
             raise ApiError("Haven command target belongs to a different location")
-        allowed = {"turn_on": 0, "turn_off": 0, "set_brightness": 1, "set_color": 1}
+        allowed = {
+            "turn_on": 0, "turn_off": 0, "set_brightness": 1, "set_color": 1,
+            "stop_effect": 0,
+        }
         prepared = []
         try:
             specifications = list(commands)
@@ -126,7 +130,15 @@ class Location:
             if target is None:
                 raise ApiError("Haven target is no longer in this location's inventory")
             for name, arguments in prepared:
-                getattr(target, name)(*arguments)
+                if name == "stop_effect":
+                    # Resolve under the same lock as prior commands and polls.
+                    # A static preset stops an active effect; a newer static
+                    # color must remain unchanged. There is no separate known
+                    # Haven effect-stop endpoint.
+                    if target.color_id in EFFECT_BY_ID:
+                        target.set_color(HAVEN_KELVIN_MAP[2700])
+                else:
+                    getattr(target, name)(*arguments)
             return self.snapshot
 
     def refresh_devices(self, force: bool = False) -> None:

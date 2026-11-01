@@ -4,7 +4,7 @@ A Home Assistant integration for Haven Lighting cloud-connected landscape lighti
 
 This project was forked from [Stephen Crescenti's Haven Lighting Redux](https://github.com/screscenti/hass-haven-lighting-redux) on **April 19, 2026**. Redux supplied the 2025 Haven API rewrite and built on [Mickey Schwab's original integration](https://github.com/mickeyschwab/haven-hass). Part 3 builds on that foundation with shared polling, account-wide request protection, safer state and device handling, and automated regression coverage. The [development history](#ai-assisted-development-since-the-fork) records the changes made since the fork.
 
-**Current integration version: 1.0.12** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
+**Current integration version: 1.0.13** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
 
 [Features](#features-and-current-scope) · [Installation](#installation-and-configuration) · [Request handling](#polling-and-request-handling) · [Automations](#automations) · [Troubleshooting](#troubleshooting) · [Change history](#ai-assisted-development-since-the-fork) · [Development tests](#development-tests)
 
@@ -18,12 +18,14 @@ The integration discovers the Haven account's **default location** and exposes i
 | Power | Turn zones and groups on or off. |
 | Brightness | Home Assistant brightness is mapped to **10 nonzero Haven levels**; zero turns the target off. |
 | RGB color | RGB input selects the nearest of **17 configured Haven color presets**. |
-| White temperature | Selects the nearest supported preset: **2700, 3000, 3500, 3700, 4000, 4100, 4700, or 5000 K**. |
+| White temperature | Selects the nearest configured preset: **2700, 3000, 3500, 3700, 4000, 4100, 4700, or 5000 K**. |
 | Effects | **Fire, Sunset, and Ocean**, with brightness reported while an effect is active. |
 | Inventory changes | New zones/groups appear on later refreshes, including after an initially empty inventory. Missing targets retain their registry entries and become unavailable. |
 | State reporting | Validated snapshots report power, brightness, RGB/white mode, and effects. Unchanged polls avoid redundant Home Assistant state writes. |
 
 Discovery currently uses the account's default location; it does not enumerate every location or provide a location selector. The brightness and color mappings above describe this integration's API controls, rather than continuous dimming or arbitrary RGB output.
+
+The inherited palette is not discovered from each device's capabilities. White requests use Haven's existing white preset IDs through `SetColor`; the integration does not substitute RGB white or claim an arbitrary-Kelvin API. A request for **3200 K**, for example, maps to **3000 K**, which is the temperature subsequently reported to Home Assistant. Fixed-white and other products may have different capabilities; the current inventory responses do not establish a per-model capability contract.
 
 ## Installation and configuration
 
@@ -38,7 +40,7 @@ Setup prevents duplicate active entries for the same normalized email address. I
 
 ### Updating an existing installation
 
-Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.12**. A full Home Assistant restart loads the downloaded Python code; reloading the integration alone does not establish that the running code has changed.
+Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.13**. A full Home Assistant restart loads the downloaded Python code; reloading the integration alone does not establish that the running code has changed.
 
 The registry migration introduced in 1.0.7 gives targets identifiers that distinguish their account, location, and zone/group type. When a legacy target's identity can be established, migration preserves its entity ID, device ID, custom names, and area assignments. Existing automations retain their references for successfully migrated targets. Migration also handles a legacy target that first reappears after setup.
 
@@ -54,11 +56,19 @@ One Home Assistant coordinator serves all entities for a discovered location. Ba
 
 Successful commands update the addressed target's cached state and request a shared refresh after a **five-second debounce window**. That refresh lets related zones and groups catch up with the server. Network delays and provider cooldowns can extend the wait. Polling continues while lights are off or the inventory is empty so changes can still be discovered. Authentication, discovery, commands, and post-command refreshes add traffic beyond the normal background polling.
 
-Light commands accept an empty successful HTTP response as an acknowledgment, including HTTP 200 and 202. Acknowledgment updates the cached state; it does not prove the physical lights have finished changing. The scheduled inventory refresh reconciles the state reported by Haven. Nonempty malformed responses remain errors, and authentication and inventory requests still require valid response data.
+Light commands accept an empty successful HTTP response as an acknowledgment, including HTTP 200, 202, and 204. Acknowledgment updates the cached state; it does not prove the physical lights have finished changing. The scheduled inventory refresh reconciles the state reported by Haven. Version 1.0.13 also rejects an explicit JSON `success: false` in a command result object or top-level result list, even when HTTP itself succeeded. It does not infer a complete response schema from this field. Nonempty malformed responses remain errors, and authentication and inventory requests still require valid response data.
 
-Both inventory responses are validated before a new snapshot is published. A failed or malformed refresh preserves the previous snapshot and reports an update failure. Command batches cannot interleave with location polling. If a later command fails after an earlier command succeeded, the confirmed changes are retained and the failure is reported; a batch is not rolled back.
+Both inventory responses are validated before a new snapshot is published. A failed or malformed refresh preserves the previous snapshot and reports an update failure. Command batches cannot interleave with location polling. If a later command fails after an earlier command was acknowledged, those accepted changes are retained optimistically and the failure is reported; a batch is not rolled back.
 
-Failed command batches preserve the existing refresh schedule, including when brightness succeeds before color fails. Confirmed changes are published without resetting the polling timer or canceling a pending refresh. Repeated failures therefore do not keep postponing that state check. These scheduled reads still respect the account's provider cooldown.
+Failed command batches preserve the existing refresh schedule, including when brightness succeeds before color fails. Accepted changes are published without resetting the polling timer or canceling a pending refresh. Repeated failures therefore do not keep postponing that state check. These scheduled reads still respect the account's provider cooldown.
+
+### Rapid adjustments and the color-temperature marker
+
+Rapid color or temperature selections can queue faster than the account budget permits the corresponding `SetColor` and `On` requests. Deterministic tests reproduce older selections completing after newer selections have already been submitted. The observed 1.0.12 log contained successful HTTP responses and repeated color/On sequences, but did not contain the requested Kelvin values, service contexts, or reported states needed to prove a feedback loop or identify every source of the commands.
+
+**Version 1.0.13 does not coalesce or drop queued service calls.** A prototype that admitted newer color intents early also changed how Home Assistant resolved a queued `light.toggle`: it could read old power state and issue On instead of Off. The release retains Home Assistant's existing service semaphore and the location/account locks. A safe future coalescer must preserve the original intent of relative actions, including toggle and brightness steps, before Home Assistant converts them to absolute commands. Private coroutine inspection and global service overrides are not used.
+
+The diagnostics below distinguish service waiting, requested values, preset mapping, optimistic acknowledgments, and later inventory state. Snapping once to a configured preset is expected; repeated movement through older selections or movement after a later inventory read requires those records to identify the cause. Later valid inventory reports remain authoritative, so genuine changes from the Haven app are not permanently hidden.
 
 ### Shared account budget
 
@@ -90,7 +100,7 @@ data:
   brightness: 128
 ```
 
-Replace `light.front_yard` with your entity ID. To select an effect, use `effect: Ocean`, `effect: Fire`, or `effect: Sunset`. To stop an active effect, use `effect: "off"`; without a replacement RGB color or white temperature, this selects **2700 K white**. It does not restore the previous color or turn the light off.
+Replace `light.front_yard` with your entity ID. To select an effect, use `effect: Ocean`, `effect: Fire`, or `effect: Sunset`. To stop an active effect, use `effect: "off"`; without a replacement RGB color or white temperature, this selects **2700 K white** if an effect is still active when the command executes. An existing static color is preserved. Version 1.0.13 makes this decision under the operation lock, after preceding commands, so a queued effect-off action neither misses a newly started effect nor overwrites a newer static color. It does not restore a previous color or turn the light off.
 
 Color-, temperature-, and effect-only turn-on actions explicitly request power on, even if the last poll reported the target on. This handles a light switched off by the Haven app or a schedule between polls. It adds one paced request when the light was already on. A nonzero brightness command already requests power on; zero brightness turns the target off.
 
@@ -106,6 +116,7 @@ Color-, temperature-, and effect-only turn-on actions explicitly request power o
 | Credentials have expired | Complete the integration's reauthentication flow. |
 | Retired targets remain listed | Registry entries are preserved to protect customization and automation references. Remove permanently retired devices through Home Assistant when appropriate. |
 | Color or brightness differs from the requested value | Check the preset and brightness mappings in the feature table. |
+| The temperature control marker moves after release | One snap to the nearest configured preset is expected. Rapid adjustments can still create a command backlog in 1.0.13. Capture the action and poll diagnostics below to distinguish queued selections from a later inventory report; the marker issue is not declared fully resolved. |
 | A light action fails with `Expecting value: line 1 column 1 (char 0)` | Version 1.0.10 fixes this error when a light command receives an empty successful response. Update and restart Home Assistant. A nonempty invalid response still fails, with an error identifying the endpoint family and HTTP status; include that message when reporting a remaining problem. |
 | Logs warn that Haven uses `device_registry.devices` as a mapping | Version 1.0.11 uses the supported registry iteration on newer Home Assistant versions while retaining compatibility with older versions. This warning is separate from command-response parsing errors. |
 | An API redirect is rejected | Check the configured API environment. Fixed endpoints reject redirects so login bodies are not forwarded and additional requests cannot bypass pacing. |
@@ -120,15 +131,38 @@ logger:
     custom_components.haven: debug
 ```
 
-Version 1.0.12 extends the HTTP-attempt records introduced in 1.0.8. Example:
+Version 1.0.13 adds an action trace to the HTTP-attempt records introduced in 1.0.8 and extended in 1.0.12. Example format, with illustrative values:
 
 ```text
-Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.250s version=1.0.12 response_bytes=128
+Haven HTTP attempt: method=POST endpoint=/Commands/SetColor status=200 elapsed=0.250s version=1.0.13 response_bytes=0 trace=012345abcdef
 ```
 
-Each record represents an actual HTTP transport attempt and includes its method, fixed endpoint-family label, status or transport-failure marker, elapsed time, imported integration version, and response byte count. Timing excludes waiting for serialization or pacing. The byte count describes the already-read body after any HTTP content decoding; `unavailable` means no response was returned. These records omit credentials, tokens, headers, body contents, target IDs, and query values. A locally rejected cooldown call produces no HTTP-attempt record. A transport failure does not establish that the request reached Haven.
+Each record represents an actual HTTP transport attempt and includes its method, fixed endpoint-family label, status or transport-failure marker, elapsed time, imported integration version, response byte count, and trace. Timing excludes waiting for serialization or pacing. The byte count describes the already-read body after any HTTP content decoding; `unavailable` means no response was returned. These records omit credentials, tokens, headers, body contents, target IDs, and query values. A locally rejected cooldown call produces no HTTP-attempt record. A transport failure does not establish that the request reached Haven. `trace=-` means the request occurred outside a traced entity action or poll, such as initial authentication.
 
-After updating and restarting Home Assistant, enable debug logging and look for `version=1.0.12` in a new HTTP-attempt record. This value comes from the imported client code, rather than rereading the downloaded manifest during each request. A successful command with `response_bytes=0` has an empty acknowledgment; a parsing error with a nonzero count needs further investigation without assuming that the body was empty.
+The same opt-in DEBUG setting also enables these records:
+
+| Record | Meaning |
+| --- | --- |
+| `Haven action: phase=service_received` / `service_finished` | Boundary of HA's service wrapper, including its semaphore wait. HA 2024.1 single-entity calls bypass this hook. Finished includes errors or cancellation; only `accepted` identifies an acknowledged batch. |
+| `Haven action: phase=received` | Entity-level requested mode, Kelvin/RGB/brightness/effect, mapped command list, running HA and integration versions, and anonymous context/parent links. |
+| `Haven action: phase=started` | Coordinator execution begins; `queue_wait` measures only the wait since entity-level receipt, not an earlier HA semaphore wait. |
+| `Haven action: phase=accepted` / `error` | Before/after cached state, elapsed time, and `source=optimistic`; errors include HTTP status when available and whether cooldown blocked HTTP locally. |
+| `Haven poll` / `Haven poll state` | A separate trace links the two inventory GETs to their reported state, including mode, preset ID and Kelvin, with `source=inventory`. |
+| `Haven color configuration` | The entity's configured supported modes and white presets, explicitly labeled `capability_source=inherited_presets`. |
+
+Action traces propagate into executor work, linking SetColor and On to the same action. Target, context, and parent references use a random process-local keyed hash; the new records contain no raw account, entity, device, context, or user IDs. A boolean records whether a user context exists. These links can help compare manual actions and automation chains, but do not by themselves identify a particular automation or prove a loop. They change after restart. Existing Home Assistant/framework messages and other integrations may contain identifying information; review the complete log before sharing it.
+
+After updating and restarting Home Assistant, enable debug logging and look for `version=1.0.13` in a new HTTP-attempt record. This value comes from the imported client code, rather than rereading the downloaded manifest during each request. A successful command with `response_bytes=0` has an empty acknowledgment; a parsing error with a nonzero count needs further investigation without assuming that the body was empty.
+
+### Manual temperature check
+
+1. Redownload the update, fully restart Home Assistant, and verify a new request log says `version=1.0.13`. Record the actual Home Assistant version and Haven device/controller model.
+2. Enable debug logging. Select red, then select **2700 K**. Check the physical light and Home Assistant's active color mode and temperature.
+3. Select **2700 K** and **5000 K** separately. Try **3200 K** and expect the configured **3000 K** preset. Change only brightness and verify temperature mode is preserved.
+4. Make a short series of rapid temperature changes, ending on **2700 K**. Stop interacting and let outstanding actions and a successful inventory refresh finish. Note whether the marker moves during command completion or only after the poll. This release still executes intermediate selections.
+5. Try Fire followed by effect-off, and Fire followed by a static color and effect-off. Expect 2700 K in the first case and the selected static color in the second. Test an ordinary Off action separately.
+6. Change the light in the Haven app, then allow a successful HA inventory refresh. Confirm that the external change appears without new command POSTs generated by the refresh.
+7. Disable debug logging and save the relevant log excerpt, along with the exact action sequence, expected final temperature, observed marker behavior, and whether the physical light matched it. Include service/action/poll traces rather than only the WebSocket error wrapper.
 
 The API defaults are centralized in [`havenlighting/config.py`](custom_components/haven/havenlighting/config.py). Both remain on the inherited `https://stg-api.havenlighting.com/api` host. The client reuses a Requests session with a **five-second connection timeout** and **thirty-second read-inactivity timeout**; these are not a total wall-clock deadline. The cooldown storage file contains a hashed account key and budget metadata, without passwords or access tokens. Account credentials are managed separately by the Home Assistant configuration entry.
 
@@ -136,9 +170,9 @@ For an unresolved problem, [open an issue](https://github.com/pinskig/hass-haven
 
 ## AI-assisted development since the fork
 
-Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.12, including earlier approaches that later releases replaced.
+Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.13, including earlier approaches that later releases replaced.
 
-The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, effect commands, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.12 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
+The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, effect commands, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.13 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
 
 ### April 19, 2026 — Initial polling and rate-limit work
 
@@ -238,17 +272,34 @@ Reorganized the README around features, compatibility, HACS installation, config
 - Added the imported integration version and response byte count to each HTTP-attempt DEBUG record. Debugging enabled after startup can now distinguish running code from downloaded files and empty replies from nonempty replies, without recording response contents.
 - Added a real Home Assistant regression for the partially successful brightness/color sequence, plus a consistency check between the imported version marker and the integration manifest.
 
+### October 31, 2026 — Version 1.0.13
+
+- Applied the useful command-result validation identified while reviewing the updated original projects: an explicit `success: false` now fails the command before publishing a false optimistic success. Empty successful replies remain valid acknowledgments, accepted partial changes remain visible, and failures do not replay commands or send a trailing On.
+- Added opt-in, redacted action-to-HTTP traces, service/coordinator timing, requested and mapped values, configured color modes, and before/after state. Inventory reads have separate traces and explicitly identify reported state. Logs distinguish optimistic acknowledgment from physical-state confirmation.
+- Fixed the effect-off decision to use execution-time state under the operation lock. Concurrent commands on older HA paths can no longer leave a newly started effect active or replace a newer static color with the white fallback.
+- Rechecked RGB-to-white transitions, all eight configured white presets, boundary rounding, brightness-only mode preservation, empty responses, failures, rapid adjustments, and external reconciliation with actual Home Assistant. Added guards for current HA's serialized toggle and brightness-step behavior.
+- Reproduced a rapid-adjustment backlog, but withheld a coalescing prototype after it introduced a relative-service ordering regression. The release preserves existing serialization and does not claim the marker problem is fully resolved. It adds the diagnostics needed to separate backlog, preset snapping, and subsequent provider state.
+- Updated the README with the investigation limits, upstream decisions, debug fields, and a manual reproduction checklist.
+
+#### Upstream comparison and integration decisions
+
+The comparison examined [Mickey Schwab's Home Assistant integration at `8f5ac1c`](https://github.com/mickeyschwab/haven-hass/tree/8f5ac1c4775ff3f1895c8c7914b40503a9f83082) and [Python client at `39d8f5e`](https://github.com/mickeyschwab/haven-python/tree/39d8f5e8a27cf262a3a68a0f826844288cfc37af), alongside the Redux foundation. The explicit unsuccessful-result check is implemented locally without changing Part 3's public light controls, target identities, stored data, dependency requirements, or supported HA minimum.
+
+The upstream `InformationSummaryWithAllZonesGroup` endpoint is a promising way to reduce inventory reads, but a representative zone/group payload and capability schema are still missing. Switching to it now could lose target type, color, or group membership semantics, so Part 3 retains its validated two-request inventory path. The upstream HTTP transport change is also deferred: this installation's observed requests succeeded with Requests, and there is no demonstrated need to add `curl_cffi`. No continuous-Kelvin endpoint or per-device capability mapping was established by that review. No changes have been submitted to the original repositories.
+
 ## Development tests
 
-Version **1.0.12** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
+Version **1.0.13** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
 
 | Suite | Environment | Result |
 | --- | --- | --- |
-| Client and adapter regressions | Python 3.12 | 106 passed |
-| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 42 passed |
-| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 42 passed |
+| Client and adapter regressions | Python 3.12 | 121 passed |
+| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 65 passed, 2 skipped |
+| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 67 passed |
 
 These are controlled offline checks. They exercise actual Home Assistant behavior against fake Haven responses; they do not certify live-provider quotas or physical-light behavior. The declared Home Assistant minimum is 2024.1.0; the framework matrix tests the two exact releases above.
+
+The two minimum-version skips cover concurrent single-entity toggle and relative-brightness ordering: HA 2024.1 bypasses its platform semaphore on that path, a pre-existing framework limitation this release does not fix. Both ordering tests run and pass on HA 2026.10.4. All preset, effect-off, empty-response, action-diagnostic, and external-reconciliation tests run on both versions. The tests verify final backend state and absence of poll-generated command loops; they do not observe the browser control marker or a physical Haven device.
 
 ### Unit and contract tests
 

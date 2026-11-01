@@ -1,6 +1,8 @@
 """Platform for Haven light integration."""
 from __future__ import annotations
+from collections.abc import Coroutine
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.light import (
@@ -20,10 +22,16 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .havenlighting.colors import (
+    EFFECT_BY_ID, HAVEN_EFFECT_MAP, HAVEN_KELVIN_MAP, HAVEN_RGB_MAP,
+    KELVIN_BY_ID, RGB_BY_ID,
+)
 from .const import DOMAIN
 from .coordinator import HavenCoordinator
 from .havenlighting.models import LightState, TargetKey
+from .havenlighting.request_context import new_request_trace, request_trace
 from .registry import async_prepare_registries, entity_unique_id
+from .trace import action_description, target_reference
 
 try:
     from homeassistant.components.light import EFFECT_OFF
@@ -32,45 +40,10 @@ except ImportError:  # Home Assistant 2024.1 predates this convenience constant.
 
 _LOGGER = logging.getLogger(__name__)
 
-# Polls are centralized in the coordinator. Serialize entity service calls too.
+# Keep HA's service serialization: it resolves toggle/brightness steps before
+# entering our entity methods. Allowing those calls through early loses their
+# relative intent. The coordinator and account locks also serialize device I/O.
 PARALLEL_UPDATES = 1
-
-# --- MAPPING TABLES ---
-
-HAVEN_KELVIN_MAP = {
-    2700: 1, 3000: 2, 3500: 3, 3700: 4,
-    4000: 5, 4100: 6, 4700: 7, 5000: 8,
-}
-
-HAVEN_RGB_MAP = {
-    (255, 0, 0): 11,      # Red
-    (255, 100, 0): 13,    # Pumpkin
-    (255, 191, 0): 14,    # Amber
-    (255, 128, 0): 15,    # Tangerine
-    (255, 215, 0): 16,    # Marigold
-    (255, 255, 0): 18,    # Yellow
-    (191, 255, 0): 19,    # Lime
-    (128, 255, 0): 20,    # Light Green
-    (0, 255, 0): 21,      # Green
-    (0, 255, 128): 22,    # Sea Foam
-    (64, 224, 208): 23,   # Turquoise
-    (0, 0, 255): 25,      # Deep Blue
-    (127, 0, 255): 26,    # Violet
-    (128, 0, 128): 27,    # Purple
-    (230, 230, 250): 28,  # Lavender
-    (255, 192, 203): 29,  # Pink
-    (255, 105, 180): 30,  # Hot Pink
-}
-
-HAVEN_EFFECT_MAP = {
-    "Fire": 12,
-    "Sunset": 17,
-    "Ocean": 24
-}
-
-KELVIN_BY_ID = {color_id: kelvin for kelvin, color_id in HAVEN_KELVIN_MAP.items()}
-RGB_BY_ID = {color_id: rgb for rgb, color_id in HAVEN_RGB_MAP.items()}
-EFFECT_BY_ID = {color_id: effect for effect, color_id in HAVEN_EFFECT_MAP.items()}
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -195,6 +168,29 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
             return EFFECT_OFF
         return None
 
+    async def async_request_call(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        """Trace HA's service wait without changing its semaphore or inputs.
+
+        Older HA single-entity calls bypass this hook; the coordinator creates
+        their action trace when the entity method is reached instead.
+        """
+        trace_id = new_request_trace()
+        started = time.monotonic()
+        _LOGGER.debug(
+            "Haven action: phase=service_received trace=%s target=%s",
+            trace_id, target_reference(self.coordinator.account_id, self._key),
+        )
+        with request_trace(trace_id):
+            try:
+                return await super().async_request_call(coro)
+            finally:
+                # Completion means the caller finished, including cancellation
+                # or an error; only phase=accepted reports a successful batch.
+                _LOGGER.debug(
+                    "Haven action: phase=service_finished trace=%s elapsed=%.3fs",
+                    trace_id, time.monotonic() - started,
+                )
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
         commands: list[tuple[str, tuple]] = []
@@ -217,10 +213,10 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
             color_id = HAVEN_KELVIN_MAP[color_id]
         elif ATTR_RGB_COLOR in kwargs:
             color_id = self._find_closest_color_id(*kwargs[ATTR_RGB_COLOR])
-        elif effect == EFFECT_OFF and self._state.color_id in EFFECT_BY_ID:
-            # A static white preset stops an effect when no replacement color
-            # was supplied. Haven has no separate effect-stop endpoint here.
-            color_id = HAVEN_KELVIN_MAP[2700]
+        elif effect == EFFECT_OFF:
+            # Decide against execution-time state: an earlier queued action
+            # may start an effect or select a static color before this runs.
+            commands.append(("stop_effect", ()))
 
         if color_id is not None:
             commands.append(("set_color", (color_id,)))
@@ -228,11 +224,25 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
         # other turn_on requests must explicitly power the target on.
         if ATTR_BRIGHTNESS not in kwargs:
             commands.append(("turn_on", ()))
-        await self.coordinator.async_send_commands(self._key, commands)
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Haven color configuration: target=%s supported_modes=%s white_kelvin=%s "
+                "capability_source=inherited_presets",
+                target_reference(self.coordinator.account_id, self._key),
+                sorted(mode.value for mode in self.supported_color_modes),
+                sorted(HAVEN_KELVIN_MAP),
+            )
+        await self.coordinator.async_send_commands(
+            self._key, commands,
+            requested=action_description(kwargs, getattr(self, "_context", None)),
+        )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
-        await self.coordinator.async_send_commands(self._key, [("turn_off", ())])
+        await self.coordinator.async_send_commands(
+            self._key, [("turn_off", ())],
+            requested=action_description(kwargs, getattr(self, "_context", None), turn_off=True),
+        )
 
     @staticmethod
     def _find_closest_color_id(r: int, g: int, b: int) -> int:
