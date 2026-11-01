@@ -113,7 +113,7 @@ def command_description(commands: list[tuple[str, tuple]]) -> list[tuple[str, tu
             continue
         name, arguments = specification
         safe_name = name if isinstance(name, str) and name in {
-            "turn_on", "turn_off", "set_color", "set_brightness", "stop_effect"
+            "turn_on", "turn_off", "set_color", "set_brightness", "stop_effect", "set_white"
         } else "unknown"
         safe_arguments = (
             tuple(_number(value) for value in arguments)

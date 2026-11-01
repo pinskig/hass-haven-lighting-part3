@@ -1,12 +1,14 @@
-"""Haven's inherited discrete color presets, shared by commands and state.
+"""Haven's discrete color presets, shared by commands and state.
 
 These mappings are not a device capability discovery result. The integration
 uses SetColor with a preset ID; no continuous-Kelvin endpoint is established.
+The white IDs match the colorDefinitions response captured during the Homey
+work on 2025-05-26; preset 6 is 4400 K, not the inherited 4100 K label.
 """
 
 HAVEN_KELVIN_MAP = {
     2700: 1, 3000: 2, 3500: 3, 3700: 4,
-    4000: 5, 4100: 6, 4700: 7, 5000: 8,
+    4000: 5, 4400: 6, 4700: 7, 5000: 8,
 }
 
 HAVEN_RGB_MAP = {

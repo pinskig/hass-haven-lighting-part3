@@ -62,6 +62,7 @@ class CommandResultTests(unittest.TestCase):
             ("turn_off", (), {"is_on": False}),
             ("set_brightness", (8,), {"brightness": 204, "is_on": True}),
             ("set_color", (25,), {"color_id": 25}),
+            ("set_white", (), {"color_id": 1}),
         )
 
     def test_empty_acknowledgments_remain_accepted(self):
@@ -137,6 +138,70 @@ class CommandResultTests(unittest.TestCase):
                 light.turn_on()
                 self.assertTrue(light.is_on)
                 self.assertEqual(len(self.sent), before + 1)
+
+    def test_white_preserves_current_white_preset_and_numeric_payload(self):
+        for kind in ("Zone", "Group"):
+            for color_id in range(1, 9):
+                with self.subTest(kind=kind, color_id=color_id):
+                    key = TargetKey(123, kind, 456)
+                    light = Light.from_state(self.credentials, LightState(
+                        key, "Offline target", False, 128, color_id,
+                    ))
+                    self.replies.append((200, b""))
+                    before = len(self.sent)
+                    light.set_white()
+                    self.assertEqual(len(self.sent), before + 1)
+                    request = self.sent[-1]
+                    self.assertEqual(urlsplit(request.url).path, "/api/Commands/SetColor")
+                    payload = json.loads(request.body)
+                    self.assertEqual(payload, {"id": 456, "type": kind, "colorId": color_id})
+                    self.assertIs(type(payload["colorId"]), int)
+                    self.assertEqual(light.color_id, color_id)
+                    self.assertEqual(light.brightness, 128)
+                    self.assertFalse(light.is_on)
+
+    def test_white_uses_warm_preset_for_rgb_effect_or_unknown_state(self):
+        for color_id in (None, 0, 11, 12, 25, 28, 999):
+            with self.subTest(color_id=color_id):
+                light = Light.from_state(self.credentials, LightState(
+                    TargetKey(123, "Zone", 456), "Offline target", True, 204, color_id,
+                ))
+                self.replies.append((200, {"success": True}))
+                before = len(self.sent)
+                light.set_white()
+                self.assertEqual(len(self.sent), before + 1)
+                self.assertEqual(json.loads(self.sent[-1].body)["colorId"], 1)
+                self.assertEqual(light.color_id, 1)
+                self.assertEqual(light.brightness, 204)
+                self.assertTrue(light.is_on)
+
+    def test_white_batch_uses_the_preceding_commands_white_preset(self):
+        location = Location(self.credentials, 123, {"name": "Offline location"})
+        key = TargetKey(123, "Zone", 456)
+        self.replies.extend([
+            (200, [{"id": 456, "name": "Offline target", "isZone": True,
+                    "isOn": False, "lightBrightnessId": 5, "colorId": 11}]),
+            (200, []),
+        ])
+        location.refresh_devices()
+        before = len(self.sent)
+        self.replies.extend([(200, b""), (200, b"")])
+        snapshot = location.execute_commands(key, [("set_color", (6,)), ("set_white", ())])
+        requests_sent = self.sent[before:]
+        self.assertEqual([urlsplit(request.url).path for request in requests_sent], [
+            "/api/Commands/SetColor", "/api/Commands/SetColor",
+        ])
+        self.assertEqual([json.loads(request.body)["colorId"] for request in requests_sent], [6, 6])
+        self.assertEqual(snapshot[key].color_id, 6)
+        self.assertEqual(snapshot[key].brightness, 128)
+        self.assertFalse(snapshot[key].is_on)
+
+    def test_white_rejects_arguments_before_any_batch_side_effect(self):
+        location = Location(self.credentials, 123, {"name": "Offline location"})
+        key = TargetKey(123, "Zone", 456)
+        with self.assertRaisesRegex(ApiError, "Invalid argument count"):
+            location.execute_commands(key, [("turn_on", ()), ("set_white", (6,))])
+        self.assertEqual(self.sent, [])
 
     def test_batch_keeps_successful_brightness_then_stops_on_color_failure(self):
         location = Location(self.credentials, 123, {"name": "Offline location"})

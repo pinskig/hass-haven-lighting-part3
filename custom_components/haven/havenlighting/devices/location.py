@@ -102,7 +102,7 @@ class Location:
             raise ApiError("Haven command target belongs to a different location")
         allowed = {
             "turn_on": 0, "turn_off": 0, "set_brightness": 1, "set_color": 1,
-            "stop_effect": 0,
+            "stop_effect": 0, "set_white": 0,
         }
         prepared = []
         try:

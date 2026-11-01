@@ -119,7 +119,7 @@ def queued_services(hass, haven_api, monkeypatch):
 @pytest.mark.parametrize(
     ("updates", "expected_ids", "expected_kelvin"),
     [
-        ([{"color_temp_kelvin": value} for value in (3500, 3700, 4100, 5000)],
+        ([{"color_temp_kelvin": value} for value in (3500, 3700, 4400, 5000)],
          [3, 4, 6, 8], 5000),
         ([{"rgb_color": (0, 0, 255)}, {"rgb_color": (0, 255, 0)},
           {"color_temp_kelvin": 2700}], [25, 21, 1], 2700),
@@ -222,7 +222,7 @@ async def test_failed_color_request_does_not_replay_or_undo_prior_commands(
     before = len(budget_transport.calls)
     outcomes = await queued_services([
         ("turn_on", {"entity_id": entity_id, "color_temp_kelvin": value})
-        for value in (3500, 3700, 4100, 5000)
+        for value in (3500, 3700, 4400, 5000)
     ])
     assert outcomes[:3] == [None, None, None]
     assert isinstance(outcomes[3], HomeAssistantError)
@@ -232,7 +232,7 @@ async def test_failed_color_request_does_not_replay_or_undo_prior_commands(
         ("POST", "/Commands/SetColor"), ("POST", "/Commands/On"),
         ("POST", "/Commands/SetColor"),
     ]
-    assert hass.states.get(entity_id).attributes["color_temp_kelvin"] == 4100
+    assert hass.states.get(entity_id).attributes["color_temp_kelvin"] == 4400
 
 
 @pytest.mark.skipif(
@@ -328,8 +328,9 @@ async def test_queued_effect_off_preserves_the_preceding_static_color(
 @pytest.mark.parametrize(
     ("requested", "color_id", "reported"),
     [(2700, 1, 2700), (3000, 2, 3000), (3500, 3, 3500), (3700, 4, 3700),
-     (4000, 5, 4000), (4100, 6, 4100), (4700, 7, 4700), (5000, 8, 5000),
-     (3200, 2, 3000), (4050, 5, 4000)],
+     (4000, 5, 4000), (4400, 6, 4400), (4700, 7, 4700), (5000, 8, 5000),
+     (3200, 2, 3000), (4050, 5, 4000), (4100, 5, 4000),
+     (4200, 5, 4000), (4201, 6, 4400), (4550, 6, 4400), (4551, 7, 4700)],
 )
 async def test_white_preset_roundtrip_and_brightness_preserve_temperature_mode(
     hass, real_loaded_entry, haven_api, requested, color_id, reported
@@ -357,3 +358,79 @@ async def test_white_preset_roundtrip_and_brightness_preserve_temperature_mode(
     assert state.attributes["color_temp_kelvin"] == reported
     assert state.attributes["brightness"] == 204
     assert _commands(haven_api) == expected
+
+
+@pytest.mark.parametrize(
+    ("initial_id", "expected_id", "kelvin"),
+    [(11, 1, 2700), (12, 1, 2700), (28, 1, 2700), (None, 1, 2700),
+     (1, 1, 2700), (6, 6, 4400), (8, 8, 5000)],
+)
+async def test_rgb_white_sends_a_white_preset_and_preserves_brightness(
+    hass, real_loaded_entry, haven_api, budget_transport,
+    initial_id, expected_id, kelvin,
+):
+    """Neutral RGB white must never select the old nearest-color lavender."""
+    haven_api.zones[0].update(isOn=True, lightBrightnessId=3, colorId=initial_id)
+    coordinator = hass.data["haven"][real_loaded_entry.entry.entry_id]["coordinators"][0]
+    await coordinator.async_refresh()
+    await async_drain_scheduled_work(hass)
+    entity_id = entity_for(hass)
+    # Unknown color modes hide brightness in HA's rendered attributes, even
+    # when the provider snapshot has a known level that must be retained.
+    brightness = next(iter(coordinator.data.values())).brightness
+    budget_transport.command_response_body = b""
+
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id, "rgb_color": [255, 255, 255]},
+        blocking=True,
+    )
+
+    assert _commands(haven_api) == _color_commands(expected_id)
+    assert haven_api.command_calls[0][2]["json"] == {
+        "id": 101, "type": "Zone", "colorId": expected_id,
+    }
+    state = hass.states.get(entity_id)
+    assert state.attributes["color_mode"] == "color_temp"
+    assert state.attributes["color_temp_kelvin"] == kelvin
+    # HA synthesizes display RGB from Kelvin even though the provider receives
+    # only colorId. The active mode and captured payload establish white intent.
+    assert state.attributes["effect"] == "off"
+    assert state.attributes["brightness"] == brightness
+
+    await coordinator.async_refresh()
+    await async_drain_scheduled_work(hass)
+    assert _commands(haven_api) == _color_commands(expected_id)
+    assert hass.states.get(entity_id).attributes["color_temp_kelvin"] == kelvin
+
+
+async def test_rgb_white_after_queued_temperature_keeps_the_new_white_preset(
+    hass, real_loaded_entry, haven_api, queued_services,
+):
+    """Resolve unspecified white against execution-time state, not old red."""
+    haven_api.zones[0].update(isOn=True, colorId=11)
+    coordinator = hass.data["haven"][real_loaded_entry.entry.entry_id]["coordinators"][0]
+    await coordinator.async_refresh()
+    await async_drain_scheduled_work(hass)
+    entity_id = entity_for(hass)
+    outcomes = await queued_services([
+        ("turn_on", {"entity_id": entity_id, "color_temp_kelvin": 4400}),
+        ("turn_on", {"entity_id": entity_id, "rgb_color": [255, 255, 255]}),
+    ])
+    assert outcomes == [None, None]
+    assert _commands(haven_api) == _color_commands(6) + _color_commands(6)
+    assert hass.states.get(entity_id).attributes["color_temp_kelvin"] == 4400
+
+
+@pytest.mark.parametrize(
+    ("rgb", "expected_id"), [([255, 196, 160], 29), ([255, 254, 252], 28)],
+)
+async def test_nonwhite_rgb_still_uses_the_existing_color_presets(
+    hass, real_loaded_entry, haven_api, rgb, expected_id,
+):
+    """Do not reinterpret pale colors as an invented Kelvin temperature."""
+    entity_id = entity_for(hass)
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id, "rgb_color": rgb}, blocking=True,
+    )
+    assert _commands(haven_api) == _color_commands(expected_id)
+    assert hass.states.get(entity_id).attributes["color_mode"] == "rgb"

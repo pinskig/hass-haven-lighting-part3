@@ -212,7 +212,13 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
             color_id = min(HAVEN_KELVIN_MAP, key=lambda value: abs(value - kelvin))
             color_id = HAVEN_KELVIN_MAP[color_id]
         elif ATTR_RGB_COLOR in kwargs:
-            color_id = self._find_closest_color_id(*kwargs[ATTR_RGB_COLOR])
+            if tuple(kwargs[ATTR_RGB_COLOR]) == (255, 255, 255):
+                # RGB white has no Kelvin value. Resolve a real white preset
+                # under the operation lock: retain the current white setting,
+                # or use warm white when coming from a color or effect.
+                commands.append(("set_white", ()))
+            else:
+                color_id = self._find_closest_color_id(*kwargs[ATTR_RGB_COLOR])
         elif effect == EFFECT_OFF:
             # Decide against execution-time state: an earlier queued action
             # may start an effect or select a static color before this runs.

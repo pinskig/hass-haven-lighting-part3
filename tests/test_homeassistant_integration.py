@@ -221,7 +221,7 @@ def framework_modules():
             setattr(modules[parent], attribute, module)
     modules["homeassistant.config_entries"].ConfigEntry = ConfigEntry
     modules["homeassistant.config_entries"].ConfigFlow = ConfigFlow
-    modules["homeassistant.const"].Platform = SimpleNamespace(LIGHT="light")
+    modules["homeassistant.const"].Platform = SimpleNamespace(LIGHT="light", SELECT="select")
     modules["homeassistant.const"].CONF_EMAIL = "email"
     modules["homeassistant.const"].CONF_PASSWORD = "password"
     modules["homeassistant.const"].EVENT_HOMEASSISTANT_STOP = "homeassistant_stop"

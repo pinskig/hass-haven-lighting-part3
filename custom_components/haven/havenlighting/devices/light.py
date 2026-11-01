@@ -6,6 +6,7 @@ from dataclasses import replace
 import threading
 from typing import Any
 
+from ..colors import HAVEN_KELVIN_MAP, KELVIN_BY_ID
 from ..credentials import Credentials
 from ..exceptions import ApiError
 from ..models import LightState, TargetKey, TargetKind
@@ -150,3 +151,10 @@ class Light:
     def set_color(self, color_id: int) -> None:
         color_id = parse_integer(color_id, "colorId")
         self._send_command("/Commands/SetColor", changes={"color_id": color_id}, colorId=color_id)
+
+    def set_white(self) -> None:
+        """Keep the current white preset or select the warm-white fallback."""
+        # Location executes this decision under its operation lock, after any
+        # preceding queued temperature command has published its accepted state.
+        color_id = self.color_id
+        self.set_color(color_id if color_id in KELVIN_BY_ID else HAVEN_KELVIN_MAP[2700])

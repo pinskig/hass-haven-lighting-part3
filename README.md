@@ -4,7 +4,7 @@ A Home Assistant integration for Haven Lighting cloud-connected landscape lighti
 
 This project was forked from [Stephen Crescenti's Haven Lighting Redux](https://github.com/screscenti/hass-haven-lighting-redux) on **April 19, 2026**. Redux supplied the 2025 Haven API rewrite and built on [Mickey Schwab's original integration](https://github.com/mickeyschwab/haven-hass). Part 3 builds on that foundation with shared polling, account-wide request protection, safer state and device handling, and automated regression coverage. The [development history](#ai-assisted-development-since-the-fork) records the changes made since the fork.
 
-**Current integration version: 1.0.13** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
+**Current integration version: 1.0.14** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
 
 [Features](#features-and-current-scope) · [Installation](#installation-and-configuration) · [Request handling](#polling-and-request-handling) · [Automations](#automations) · [Troubleshooting](#troubleshooting) · [Change history](#ai-assisted-development-since-the-fork) · [Development tests](#development-tests)
 
@@ -17,15 +17,18 @@ The integration discovers the Haven account's **default location** and exposes i
 | Zones and groups | Control zones and groups separately, including targets whose numeric IDs overlap. Individual fixtures outside those zone/group records are not exposed separately. |
 | Power | Turn zones and groups on or off. |
 | Brightness | Home Assistant brightness is mapped to **10 nonzero Haven levels**; zero turns the target off. |
-| RGB color | RGB input selects the nearest of **17 configured Haven color presets**. |
-| White temperature | Selects the nearest configured preset: **2700, 3000, 3500, 3700, 4000, 4100, 4700, or 5000 K**. |
+| RGB color | RGB input selects the nearest of **17 configured Haven color presets**. Exact RGB white `[255, 255, 255]` selects a white preset instead; see below. |
+| White temperature | Selects the nearest configured preset: **2700, 3000, 3500, 3700, 4000, 4400, 4700, or 5000 K**. |
+| Exact white presets | Each zone/group has a **White temperature** dropdown with those eight choices. Selecting one sends its exact Haven color ID and turns the target on, preserving brightness. |
 | Effects | **Fire, Sunset, and Ocean**, with brightness reported while an effect is active. |
 | Inventory changes | New zones/groups appear on later refreshes, including after an initially empty inventory. Missing targets retain their registry entries and become unavailable. |
 | State reporting | Validated snapshots report power, brightness, RGB/white mode, and effects. Unchanged polls avoid redundant Home Assistant state writes. |
 
 Discovery currently uses the account's default location; it does not enumerate every location or provide a location selector. The brightness and color mappings above describe this integration's API controls, rather than continuous dimming or arbitrary RGB output.
 
-The inherited palette is not discovered from each device's capabilities. White requests use Haven's existing white preset IDs through `SetColor`; the integration does not substitute RGB white or claim an arbitrary-Kelvin API. A request for **3200 K**, for example, maps to **3000 K**, which is the temperature subsequently reported to Home Assistant. Fixed-white and other products may have different capabilities; the current inventory responses do not establish a per-model capability contract.
+The palette is not discovered from each device's capabilities. White requests use Haven's existing white preset IDs through `SetColor`; the integration does not substitute RGB white or claim an arbitrary-Kelvin API. A request for **3200 K**, for example, maps to **3000 K**, which is the temperature subsequently reported to Home Assistant. Fixed-white and other products may have different capabilities; the current inventory responses do not establish a per-model capability contract.
+
+The white IDs were checked against the Haven `colorDefinitions` response captured during the maintainer's Homey work on **May 26, 2025**. Version 1.0.14 corrects preset **6** from the inherited **4100 K** label to **4400 K**, without changing its numeric ID. This also corrects nearest-preset rounding: a 4100 K request now selects 4000 K. An exact midpoint selects the lower temperature.
 
 ## Installation and configuration
 
@@ -34,19 +37,40 @@ The inherited palette is not discovered from each device's capabilities. White r
 3. Download **Haven Lighting Part 3**, then restart Home Assistant.
 4. Go to **Settings → Devices & Services → Add Integration**.
 5. Search for **Haven Lighting Part 3** and enter your Haven account email and password.
-6. After setup, zones and groups from the default location appear as light entities.
+6. After setup, zones and groups from the default location appear as light entities with a companion White temperature control on each device.
 
 Setup prevents duplicate active entries for the same normalized email address. If credentials expire, use the integration's reauthentication prompt to update them.
 
 ### Updating an existing installation
 
-Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.13**. A full Home Assistant restart loads the downloaded Python code; reloading the integration alone does not establish that the running code has changed.
+Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.14**. A full Home Assistant restart loads the downloaded Python code; reloading the integration alone does not establish that the running code has changed.
 
 The registry migration introduced in 1.0.7 gives targets identifiers that distinguish their account, location, and zone/group type. When a legacy target's identity can be established, migration preserves its entity ID, device ID, custom names, and area assignments. Existing automations retain their references for successfully migrated targets. Migration also handles a legacy target that first reappears after setup.
 
 Ambiguous legacy records are retained and logged for review. The integration does not guess which current target they represent; a newly discovered target may receive a separate entry. Check affected automation references when resolving an ambiguous record. Ownership conflicts with another integration entry are reported explicitly.
 
 Version 1.0.7 began saving provider cooldowns to disk. The first upgrade from an earlier version cannot reconstruct a cooldown that existed only in the previous process's memory. Once saved, deadlines survive integration reloads and Home Assistant restarts.
+
+### Selecting white
+
+Open **Settings → Devices & Services → Haven Lighting Part 3**, choose the zone/group device, and use **White temperature**. The dropdown selects an exact preset, avoiding intermediate slider values and white-looking selections on the RGB wheel:
+
+| White temperature | Haven color ID |
+| --- | --- |
+| 2700 K | 1 |
+| 3000 K | 2 |
+| 3500 K | 3 |
+| 3700 K | 4 |
+| 4000 K | 5 |
+| 4400 K | 6 |
+| 4700 K | 7 |
+| 5000 K | 8 |
+
+Selecting white sends the existing temperature action through the linked light entity, which sends **SetColor → On**. It preserves brightness and uses the same account budget, action diagnostics, and polling as the light. The original light entity and automation references remain valid. Keep that light entity enabled; the dropdown reports an error if its linked light is disabled or missing.
+
+The dropdown follows the shared reported preset, including changes made in the Haven app. It is **unknown** while a nonwhite color/effect or an unrecognized preset is selected, and **unavailable** when its target disappears or the coordinator is unavailable. It does not remember an old white choice as though it were still active.
+
+The existing temperature slider remains supported and snaps to the nearest preset. Exact RGB white `[255, 255, 255]` now retains the white preset active when the command executes, or selects **2700 K** when coming from a color, effect, or unknown preset. Other RGB values still use the inherited color approximation: near-white RGB is not a reliable way to request a particular white temperature. Use the dropdown or an explicit `color_temp_kelvin` action for that purpose.
 
 ## Polling and request handling
 
@@ -66,7 +90,7 @@ Failed command batches preserve the existing refresh schedule, including when br
 
 Rapid color or temperature selections can queue faster than the account budget permits the corresponding `SetColor` and `On` requests. Deterministic tests reproduce older selections completing after newer selections have already been submitted. The observed 1.0.12 log contained successful HTTP responses and repeated color/On sequences, but did not contain the requested Kelvin values, service contexts, or reported states needed to prove a feedback loop or identify every source of the commands.
 
-**Version 1.0.13 does not coalesce or drop queued service calls.** A prototype that admitted newer color intents early also changed how Home Assistant resolved a queued `light.toggle`: it could read old power state and issue On instead of Off. The release retains Home Assistant's existing service semaphore and the location/account locks. A safe future coalescer must preserve the original intent of relative actions, including toggle and brightness steps, before Home Assistant converts them to absolute commands. Private coroutine inspection and global service overrides are not used.
+**Version 1.0.14 does not coalesce or drop queued service calls.** A prototype investigated for 1.0.13 admitted newer color intents early but changed how Home Assistant resolved a queued `light.toggle`: it could read old power state and issue On instead of Off. The release retains Home Assistant's existing service semaphore and the location/account locks. The white dropdown delegates to the same light service instead of independently changing power through a second platform. A safe future coalescer must preserve the original intent of relative actions, including toggle and brightness steps, before Home Assistant converts them to absolute commands. Private coroutine inspection and global service overrides are not used.
 
 The diagnostics below distinguish service waiting, requested values, preset mapping, optimistic acknowledgments, and later inventory state. Snapping once to a configured preset is expected; repeated movement through older selections or movement after a later inventory read requires those records to identify the cause. Later valid inventory reports remain authoritative, so genuine changes from the Haven app are not permanently hidden.
 
@@ -88,6 +112,28 @@ Authentication, token renewal, discovery, polling, and commands use the same req
 Explicit refreshes and repeated setup attempts respect the same gate. Ordinary transport failures and rate-limit responses do not trigger blind command retries. These safeguards reduce avoidable traffic; they do not establish Haven's service quotas or coordinate requests made by other Home Assistant instances or the Haven app.
 
 ## Automations
+
+For an exact warm-white selection, use the existing light entity:
+
+```yaml
+action: light.turn_on
+target:
+  entity_id: light.front_yard
+data:
+  color_temp_kelvin: 2700
+```
+
+Or use the companion dropdown:
+
+```yaml
+action: select.select_option
+target:
+  entity_id: select.front_yard_white_temperature
+data:
+  option: "2700 K"
+```
+
+Replace both example entity IDs with the ones shown in your installation. The dropdown sends only its selected Kelvin value to the light service; its provider command uses the corresponding integer `colorId`.
 
 Use `light.turn_on` with fields such as `rgb_color`, `brightness`, or `color_temp_kelvin`. For example, this action selects the nearest supported blue preset and brightness level:
 
@@ -115,8 +161,9 @@ Color-, temperature-, and effect-only turn-on actions explicitly request power o
 | Entities become unavailable | Check the logs for authentication, connection, payload-validation, or cooldown errors. Failed refreshes retain cached data; targets absent from a successful inventory remain unavailable. |
 | Credentials have expired | Complete the integration's reauthentication flow. |
 | Retired targets remain listed | Registry entries are preserved to protect customization and automation references. Remove permanently retired devices through Home Assistant when appropriate. |
-| Color or brightness differs from the requested value | Check the preset and brightness mappings in the feature table. |
-| The temperature control marker moves after release | One snap to the nearest configured preset is expected. Rapid adjustments can still create a command backlog in 1.0.13. Capture the action and poll diagnostics below to distinguish queued selections from a later inventory report; the marker issue is not declared fully resolved. |
+| Color or brightness differs from the requested value | Check the preset and brightness mappings in the feature table. Use White temperature for an exact white preset; near-white RGB selections still use color approximation. |
+| White temperature is unknown | The reported preset is currently a color/effect or is not in the white map. Select one of the eight white options to change it. |
+| The temperature control marker moves after release | One snap to the nearest configured preset is expected. Rapid adjustments can still create a command backlog in 1.0.14. The exact dropdown avoids continuous dragging. Capture action and poll diagnostics to distinguish queued selections from a later inventory report; physical output and the browser marker still need installation testing. |
 | A light action fails with `Expecting value: line 1 column 1 (char 0)` | Version 1.0.10 fixes this error when a light command receives an empty successful response. Update and restart Home Assistant. A nonempty invalid response still fails, with an error identifying the endpoint family and HTTP status; include that message when reporting a remaining problem. |
 | Logs warn that Haven uses `device_registry.devices` as a mapping | Version 1.0.11 uses the supported registry iteration on newer Home Assistant versions while retaining compatibility with older versions. This warning is separate from command-response parsing errors. |
 | An API redirect is rejected | Check the configured API environment. Fixed endpoints reject redirects so login bodies are not forwarded and additional requests cannot bypass pacing. |
@@ -134,7 +181,7 @@ logger:
 Version 1.0.13 adds an action trace to the HTTP-attempt records introduced in 1.0.8 and extended in 1.0.12. Example format, with illustrative values:
 
 ```text
-Haven HTTP attempt: method=POST endpoint=/Commands/SetColor status=200 elapsed=0.250s version=1.0.13 response_bytes=0 trace=012345abcdef
+Haven HTTP attempt: method=POST endpoint=/Commands/SetColor status=200 elapsed=0.250s version=1.0.14 response_bytes=0 trace=012345abcdef
 ```
 
 Each record represents an actual HTTP transport attempt and includes its method, fixed endpoint-family label, status or transport-failure marker, elapsed time, imported integration version, response byte count, and trace. Timing excludes waiting for serialization or pacing. The byte count describes the already-read body after any HTTP content decoding; `unavailable` means no response was returned. These records omit credentials, tokens, headers, body contents, target IDs, and query values. A locally rejected cooldown call produces no HTTP-attempt record. A transport failure does not establish that the request reached Haven. `trace=-` means the request occurred outside a traced entity action or poll, such as initial authentication.
@@ -152,13 +199,13 @@ The same opt-in DEBUG setting also enables these records:
 
 Action traces propagate into executor work, linking SetColor and On to the same action. Target, context, and parent references use a random process-local keyed hash; the new records contain no raw account, entity, device, context, or user IDs. A boolean records whether a user context exists. These links can help compare manual actions and automation chains, but do not by themselves identify a particular automation or prove a loop. They change after restart. Existing Home Assistant/framework messages and other integrations may contain identifying information; review the complete log before sharing it.
 
-After updating and restarting Home Assistant, enable debug logging and look for `version=1.0.13` in a new HTTP-attempt record. This value comes from the imported client code, rather than rereading the downloaded manifest during each request. A successful command with `response_bytes=0` has an empty acknowledgment; a parsing error with a nonzero count needs further investigation without assuming that the body was empty.
+After updating and restarting Home Assistant, enable debug logging and look for `version=1.0.14` in a new HTTP-attempt record. This value comes from the imported client code, rather than rereading the downloaded manifest during each request. A successful command with `response_bytes=0` has an empty acknowledgment; a parsing error with a nonzero count needs further investigation without assuming that the body was empty.
 
 ### Manual temperature check
 
-1. Redownload the update, fully restart Home Assistant, and verify a new request log says `version=1.0.13`. Record the actual Home Assistant version and Haven device/controller model.
-2. Enable debug logging. Select red, then select **2700 K**. Check the physical light and Home Assistant's active color mode and temperature.
-3. Select **2700 K** and **5000 K** separately. Try **3200 K** and expect the configured **3000 K** preset. Change only brightness and verify temperature mode is preserved.
+1. Redownload the update, fully restart Home Assistant, and verify a new request log says `version=1.0.14`. Record the actual Home Assistant version and Haven device/controller model.
+2. Enable debug logging. Select red, then use the device's **White temperature** dropdown to select **2700 K**. Check the physical light and Home Assistant's active color mode and temperature. The action should map to `set_color(1)` followed by `turn_on`.
+3. Select **4400 K** and **5000 K** separately and expect IDs 6 and 8. Change only brightness and verify temperature mode is preserved. With the existing temperature slider or a service action, try **3200 K** and expect **3000 K**.
 4. Make a short series of rapid temperature changes, ending on **2700 K**. Stop interacting and let outstanding actions and a successful inventory refresh finish. Note whether the marker moves during command completion or only after the poll. This release still executes intermediate selections.
 5. Try Fire followed by effect-off, and Fire followed by a static color and effect-off. Expect 2700 K in the first case and the selected static color in the second. Test an ordinary Off action separately.
 6. Change the light in the Haven app, then allow a successful HA inventory refresh. Confirm that the external change appears without new command POSTs generated by the refresh.
@@ -170,7 +217,7 @@ For an unresolved problem, [open an issue](https://github.com/pinskig/hass-haven
 
 ## AI-assisted development since the fork
 
-Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.13, including earlier approaches that later releases replaced.
+Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.14, including earlier approaches that later releases replaced.
 
 The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, effect commands, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.13 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
 
@@ -287,19 +334,27 @@ The comparison examined [Mickey Schwab's Home Assistant integration at `8f5ac1c`
 
 The upstream `InformationSummaryWithAllZonesGroup` endpoint is a promising way to reduce inventory reads, but a representative zone/group payload and capability schema are still missing. Switching to it now could lose target type, color, or group membership semantics, so Part 3 retains its validated two-request inventory path. The upstream HTTP transport change is also deferred: this installation's observed requests succeeded with Requests, and there is no demonstrated need to add `curl_cffi`. No continuous-Kelvin endpoint or per-device capability mapping was established by that review. No changes have been submitted to the original repositories.
 
+### November 1, 2026 — Version 1.0.14
+
+- Added a **White temperature** dropdown to each zone/group device. Its eight exact options call the existing light temperature service, select Haven's numeric white preset, preserve brightness, and explicitly turn the target on. It shares the coordinator, polling, credentials, and request budget; existing light entity IDs and automations remain valid.
+- Corrected preset ID 6 to **4400 K**, using the maintainer's recovered May 26, 2025 Haven `colorDefinitions` response from the Homey work. The recovered material also confirms Fire as ID 12; that ID remains unchanged. Corrected the affected nearest-preset rounding and reporting.
+- Fixed exact RGB white `[255, 255, 255]` selecting Lavender. It now selects the current white preset at execution time, or 2700 K when coming from a nonwhite or unknown preset. Other RGB colors retain the existing approximation; no RGB-to-Kelvin conversion was invented for pale colors.
+- Kept selector commands on the light service path to preserve current HA's handling of an in-flight white selection followed by toggle. Added regressions for exact payloads, brightness preservation, failure handling, empty acknowledgments, external changes, discovery, linked entity behavior, and white-selection ordering.
+- The November 1 log demonstrates both a command backlog and near-white RGB approximation. It also shows cloud inventory acknowledging Fire/white IDs while the maintainer reported different physical output. This release fixes the confirmed selection issues and supplies an exact white control; physical device behavior remains part of the manual check.
+
 ## Development tests
 
-Version **1.0.13** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
+Version **1.0.14** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
 
 | Suite | Environment | Result |
 | --- | --- | --- |
-| Client and adapter regressions | Python 3.12 | 121 passed |
-| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 65 passed, 2 skipped |
-| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 67 passed |
+| Client and adapter regressions | Python 3.12 | 125 passed |
+| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 99 passed, 3 skipped |
+| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 102 passed |
 
 These are controlled offline checks. They exercise actual Home Assistant behavior against fake Haven responses; they do not certify live-provider quotas or physical-light behavior. The declared Home Assistant minimum is 2024.1.0; the framework matrix tests the two exact releases above.
 
-The two minimum-version skips cover concurrent single-entity toggle and relative-brightness ordering: HA 2024.1 bypasses its platform semaphore on that path, a pre-existing framework limitation this release does not fix. Both ordering tests run and pass on HA 2026.10.4. All preset, effect-off, empty-response, action-diagnostic, and external-reconciliation tests run on both versions. The tests verify final backend state and absence of poll-generated command loops; they do not observe the browser control marker or a physical Haven device.
+The three minimum-version skips cover concurrent single-entity toggle and relative-brightness ordering, including a white selection followed by toggle: HA 2024.1 bypasses its platform semaphore on that path, a pre-existing framework limitation this release does not fix. All three ordering tests run and pass on HA 2026.10.4. All preset, effect-off, empty-response, action-diagnostic, and external-reconciliation tests run on both versions. The tests verify final backend state and absence of poll-generated command loops; they do not observe the browser control marker or a physical Haven device.
 
 ### Unit and contract tests
 

@@ -28,5 +28,12 @@
       "reauth_successful": "Haven credentials updated successfully.",
       "reauth_entry_missing": "The Haven integration entry no longer exists."
     }
+  },
+  "entity": {
+    "select": {
+      "white_temperature": {
+        "name": "White temperature"
+      }
+    }
   }
 }

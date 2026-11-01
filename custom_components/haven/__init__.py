@@ -15,7 +15,7 @@ from .havenlighting.exceptions import ApiError, AuthenticationError
 from .runtime import async_get_account_store
 from .registry import async_prepare_registries
 
-PLATFORMS: list[Platform] = [Platform.LIGHT]
+PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SELECT]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Haven Lighting from a config entry."""
