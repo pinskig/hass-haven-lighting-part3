@@ -224,20 +224,28 @@ class Credentials:
         auth_required: bool = True,
         use_prod_api: bool = False,
         timeout: int | float | None = None,
+        *,
+        allow_empty_response: bool = False,
         **kwargs: Any,
     ) -> Any:
-        """Make a request, with one serialized token renewal after a 401."""
+        """Make a request, with one serialized token renewal after a 401.
+
+        Callers may opt into empty successful command acknowledgments. All
+        nonempty responses still require valid JSON.
+        """
         with self._request_lock:
             try:
                 return self._make_request_internal(
-                    method, path, auth_required, use_prod_api, timeout, **kwargs
+                    method, path, auth_required, use_prod_api, timeout,
+                    allow_empty_response=allow_empty_response, **kwargs
                 )
             except AuthenticationError:
                 if not auth_required:
                     raise
                 if self.refresh_token():
                     return self._make_request_internal(
-                        method, path, auth_required, use_prod_api, timeout, **kwargs
+                        method, path, auth_required, use_prod_api, timeout,
+                        allow_empty_response=allow_empty_response, **kwargs
                     )
                 raise AuthenticationError("Token refresh failed") from None
 
@@ -248,6 +256,8 @@ class Credentials:
         auth_required: bool = True,
         use_prod_api: bool = False,
         timeout: int | float | None = None,
+        *,
+        allow_empty_response: bool = False,
         **kwargs: Any,
     ) -> Any:
         with self._request_lock:
@@ -337,9 +347,26 @@ class Credentials:
                     )
 
                 response.raise_for_status()
-                data = {} if status == 204 else response.json()
+                if status == 204 or (
+                    allow_empty_response and 200 <= status < 300 and not response.content
+                ):
+                    data = {}
+                else:
+                    data = response.json()
                 self._gate.record_success()
                 return data
+            except requests.exceptions.JSONDecodeError as error:
+                self._gate.record_error()
+                status = response.status_code if response is not None else None
+                detail = (
+                    "an empty response"
+                    if response is not None and not response.content else "invalid JSON"
+                )
+                raise ApiError(
+                    f"Haven API returned {detail} for {_request_endpoint_family(path)} "
+                    f"(HTTP {status})",
+                    code=status,
+                ) from error
             except requests.exceptions.RequestException as error:
                 self._gate.record_error()
                 status = response.status_code if response is not None else None

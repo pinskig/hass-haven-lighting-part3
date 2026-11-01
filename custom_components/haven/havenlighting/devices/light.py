@@ -122,7 +122,9 @@ class Light:
         # over a command that completed while its network requests were pending.
         with self._operation_lock:
             payload = {"id": self.id, "type": self.kind, **values}
-            self._credentials.make_request("POST", endpoint, json=payload, use_prod_api=True)
+            self._credentials.make_request(
+                "POST", endpoint, json=payload, use_prod_api=True, allow_empty_response=True
+            )
             with self._state_lock:
                 self._state = replace(self._state, **changes)
 

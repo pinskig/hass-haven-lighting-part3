@@ -67,14 +67,15 @@ def budget_transport(monkeypatch, haven_api, custom_integration_and_no_http):
     """Return real Response objects and observe actual session/pool closure."""
     transport = SimpleNamespace(
         calls=[], login_calls=[], login_status=200, login_retry_after=None,
-        command_status=None, closed_sessions=[], closed_adapters=[],
+        command_status=None, command_success_status=200, command_response_body=None,
+        closed_sessions=[], closed_adapters=[],
     )
 
-    def response(status, data, url, *, retry_after=None):
+    def response(status, data, url, *, retry_after=None, raw_body=None):
         result = requests.Response()
         result.status_code = status
         result.url = url
-        result._content = json.dumps(data).encode("utf-8")
+        result._content = json.dumps(data).encode("utf-8") if raw_body is None else raw_body
         result._content_consumed = True
         result.encoding = "utf-8"
         if retry_after is not None:
@@ -100,7 +101,14 @@ def budget_transport(monkeypatch, haven_api, custom_integration_and_no_http):
             }, url)
         if path.startswith("/Commands/") and transport.command_status is not None:
             return response(transport.command_status, {}, url, retry_after=3600)
-        return response(200, haven_api.make_request(method, path, **kwargs), url)
+        data = haven_api.make_request(method, path, **kwargs)
+        if path.startswith("/Commands/"):
+            # The provider may apply a command before its reply is decoded.
+            return response(
+                transport.command_success_status, data, url,
+                raw_body=transport.command_response_body,
+            )
+        return response(200, data, url)
 
     original_close = requests.sessions.Session.close
     original_adapter_close = requests.adapters.HTTPAdapter.close
@@ -394,3 +402,84 @@ async def test_setup_form_distinguishes_login_rejection_from_provider_cooldown(
         assert len(budget_transport.login_calls) == 1
         assert gate.rate_limit_remaining == 3600
     hass.config_entries.flow.async_abort(form["flow_id"])
+
+
+@pytest.mark.parametrize("status", [200, 202])
+async def test_empty_command_success_completes_color_batch_and_debounced_refresh(
+    hass, real_loaded_entry, haven_api, budget_transport, status
+):
+    from custom_components.haven.const import COMMAND_REFRESH_DELAY
+
+    entity_id = entity_for(hass)
+    assert hass.states.get(entity_id).state == "off"
+    budget_transport.command_success_status = status
+    budget_transport.command_response_body = b""
+    before = len(budget_transport.calls)
+
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id, "rgb_color": (0, 0, 255)},
+        blocking=True,
+    )
+    await async_drain_scheduled_work(hass)
+    assert [(method, path) for _session, method, path in budget_transport.calls[before:]] == [
+        ("POST", "/Commands/SetColor"), ("POST", "/Commands/On"),
+    ]
+    assert haven_api.zones[0]["colorId"] == 25
+    assert haven_api.zones[0]["isOn"] is True
+    state = hass.states.get(entity_id)
+    assert state.state == "on"
+    assert state.attributes["rgb_color"] == (0, 0, 255)
+
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=COMMAND_REFRESH_DELAY + 1)
+    )
+    await async_drain_scheduled_work(hass)
+    assert [(method, path) for _session, method, path in budget_transport.calls[before:]] == [
+        ("POST", "/Commands/SetColor"), ("POST", "/Commands/On"),
+        ("GET", f"/LightAndZones/OrderedList/{LOCATION_ID}"),
+        ("GET", f"/Group/AllGroupsByLocation/{LOCATION_ID}"),
+    ]
+    assert [call[1] for call in haven_api.command_calls] == [
+        "/Commands/SetColor", "/Commands/On",
+    ]
+    assert hass.states.get(entity_id).state == "on"
+    assert hass.states.get(entity_id).attributes["rgb_color"] == (0, 0, 255)
+
+
+async def test_malformed_command_reply_stops_batch_without_confirmation_or_replay(
+    hass, real_loaded_entry, haven_api, budget_transport
+):
+    coordinator = hass.data["haven"][real_loaded_entry.entry.entry_id]["coordinators"][0]
+    previous = coordinator.data
+    key = next(key for key in previous if key.kind == "Zone" and key.remote_id == 101)
+    assert previous[key].color_id == 1
+    assert previous[key].is_on is False
+    budget_transport.command_response_body = b'{"truncated":'
+    before = len(budget_transport.calls)
+    entity_id = entity_for(hass)
+
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            "light", "turn_on", {"entity_id": entity_id, "rgb_color": (0, 0, 255)},
+            blocking=True,
+        )
+    await async_drain_scheduled_work(hass)
+    assert [(method, path) for _session, method, path in budget_transport.calls[before:]] == [
+        ("POST", "/Commands/SetColor"),
+    ]
+    assert haven_api.zones[0]["colorId"] == 25
+    assert haven_api.zones[0]["isOn"] is False
+    assert coordinator.data == previous
+    assert hass.states.get(entity_id).state == "off"
+
+    # Reconcile the provider state with reads, never replay the ambiguous POST.
+    await coordinator.async_refresh()
+    await async_drain_scheduled_work(hass)
+    assert [(method, path) for _session, method, path in budget_transport.calls[before:]] == [
+        ("POST", "/Commands/SetColor"),
+        ("GET", f"/LightAndZones/OrderedList/{LOCATION_ID}"),
+        ("GET", f"/Group/AllGroupsByLocation/{LOCATION_ID}"),
+    ]
+    assert [call[1] for call in haven_api.command_calls] == ["/Commands/SetColor"]
+    assert coordinator.data[key].color_id == 25
+    assert coordinator.data[key].is_on is False

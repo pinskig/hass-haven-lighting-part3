@@ -23,8 +23,10 @@ from havenlighting.client import HavenClient
 from havenlighting.config import ApiConfig
 from havenlighting import credentials as credentials_module
 from havenlighting.credentials import Credentials
+from havenlighting.devices.light import Light
 from havenlighting.exceptions import ApiError, AuthenticationError
 from havenlighting.logging import setup_logging
+from havenlighting.models import LightState, TargetKey
 from havenlighting import request_gate as request_gate_module
 from havenlighting.request_gate import RequestGate
 
@@ -76,7 +78,8 @@ class TransportTests(unittest.TestCase):
         result.url = request.url
         result.status_code = status
         result.headers.update(headers or {})
-        result._content = json.dumps({} if data is None else data).encode()
+        # Bytes model the wire body exactly, including a zero-byte response.
+        result._content = data if isinstance(data, bytes) else json.dumps({} if data is None else data).encode()
         result._content_consumed = True
         result.encoding = "utf-8"
         return result
@@ -90,6 +93,150 @@ class TransportTests(unittest.TestCase):
         )
         self.addCleanup(credentials.close)
         return credentials
+
+    @staticmethod
+    def light(credentials, *, is_on=False):
+        return Light.from_state(credentials, LightState(
+            TargetKey(123456, "Zone", 101), "Offline test zone", is_on, 128, 11,
+        ))
+
+    def test_empty_successful_commands_publish_state_once_and_close_response(self):
+        commands = (
+            ("turn_on", (), {"is_on": True}),
+            ("turn_off", (), {"is_on": False}),
+            ("set_brightness", (8,), {"is_on": True, "brightness": 204}),
+            ("set_color", (25,), {"color_id": 25}),
+        )
+        for status in (200, 202, 204):
+            for name, arguments, expected in commands:
+                with self.subTest(status=status, command=name):
+                    credentials = self.credentials(RequestGate(min_request_interval=0))
+                    light = self.light(credentials, is_on=name == "turn_off")
+                    self.replies.append((status, b"", {}))
+                    before = len(self.sent)
+                    with patch.object(requests.Response, "close", autospec=True,
+                                      side_effect=requests.Response.close) as close:
+                        getattr(light, name)(*arguments)
+                    self.assertEqual(len(self.sent), before + 1)
+                    close.assert_called_once()
+                    self.assertIs(close.call_args.args[0].request, self.sent[-1][1])
+                    for field, value in expected.items():
+                        self.assertEqual(getattr(light.state, field), value)
+
+    def test_command_json_response_remains_compatible(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        light = self.light(credentials)
+        self.replies.append((200, {"accepted": True}, {}))
+        light.set_color(25)
+        self.assertEqual(light.color_id, 25)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_empty_response_remains_an_error_without_command_opt_in(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        operations = (
+            ("authenticate", lambda: credentials.authenticate("offline@example.invalid", "DUMMY_PASSWORD")),
+            ("refresh", credentials.refresh_token),
+            ("discovery", lambda: credentials.make_request("GET", "/user/GetUserInfo")),
+            ("zones", lambda: credentials.make_request("GET", "/LightAndZones/OrderedList/123456")),
+            ("groups", lambda: credentials.make_request("GET", "/Group/AllGroupsByLocation/123456")),
+            ("no opt-in", lambda: credentials.make_request("POST", "/Commands/SetColor", json={})),
+        )
+        for name, operation in operations:
+            with self.subTest(operation=name):
+                self.replies.append((200, b"", {}))
+                before = len(self.sent)
+                with self.assertRaises(ApiError) as raised:
+                    operation()
+                self.assertEqual(raised.exception.code, 200)
+                self.assertIn("empty response", str(raised.exception))
+                self.assertEqual(len(self.sent), before + 1)
+                self.assertEqual(credentials._token, "audit-token")
+
+    def test_nonempty_invalid_command_json_never_publishes_or_replays(self):
+        for status in (200, 202):
+            for body in (b"<html>PRIVATE_BODY</html>", b"{broken", b" \r\n"):
+                with self.subTest(status=status, body=body):
+                    credentials = self.credentials(RequestGate(min_request_interval=0))
+                    light = self.light(credentials)
+                    previous = light.state
+                    self.replies.append((status, body, {}))
+                    before = len(self.sent)
+                    with patch.object(requests.Response, "close", autospec=True,
+                                      side_effect=requests.Response.close) as close:
+                        with self.assertRaises(ApiError) as raised:
+                            light.set_color(25)
+                    self.assertEqual(raised.exception.code, status)
+                    self.assertIn("invalid JSON", str(raised.exception))
+                    self.assertIn("/Commands/SetColor", str(raised.exception))
+                    self.assertIn(f"HTTP {status}", str(raised.exception))
+                    self.assertIs(light.state, previous)
+                    self.assertEqual(len(self.sent), before + 1)
+                    close.assert_called_once()
+
+    def test_empty_command_opt_in_survives_401_refresh_and_retry(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        light = self.light(credentials)
+        self.replies.extend([
+            (401, b"", {}),
+            (200, {"token": "replacement-token", "refreshToken": "replacement-refresh", "id": 123}, {}),
+            (202, b"", {}),
+        ])
+        light.set_color(25)
+        self.assertEqual(light.color_id, 25)
+        self.assertEqual(len(self.sent), 3)
+        self.assertTrue(self.sent[0][1].url.endswith("/Commands/SetColor"))
+        self.assertTrue(self.sent[1][1].url.endswith("/Auth/Refresh"))
+        self.assertTrue(self.sent[2][1].url.endswith("/Commands/SetColor"))
+        self.assertEqual(self.sent[0][1].body, self.sent[2][1].body)
+        self.assertEqual(self.sent[2][1].headers["Authorization"], "Bearer replacement-token")
+
+    def test_command_opt_in_never_applies_to_token_refresh(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        light = self.light(credentials)
+        previous = light.state
+        self.replies.extend([(401, b"", {}), (200, b"", {})])
+        with self.assertRaises(ApiError) as raised:
+            light.set_color(25)
+        self.assertEqual(raised.exception.code, 200)
+        self.assertIn("empty response", str(raised.exception))
+        self.assertIn("/Auth/Refresh", str(raised.exception))
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(credentials._token, "audit-token")
+        self.assertIs(light.state, previous)
+
+    def test_empty_command_errors_preserve_failure_and_cooldown(self):
+        for status in (400, 429, 503, 500):
+            with self.subTest(status=status):
+                gate = RequestGate(min_request_interval=0)
+                credentials = self.credentials(gate)
+                light = self.light(credentials)
+                previous = light.state
+                limited = status in (429, 503)
+                self.replies.append((status, b"", {"Retry-After": "3600"} if limited else {}))
+                before = len(self.sent)
+                with self.assertRaises(ApiError) as raised:
+                    light.set_color(25)
+                self.assertEqual(raised.exception.code, status)
+                self.assertEqual(gate.rate_limit_remaining, 3600 if limited else 0)
+                self.assertIs(light.state, previous)
+                self.assertEqual(len(self.sent), before + 1)
+
+    def test_json_decode_errors_omit_body_headers_ids_and_query_values(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        self.replies.append((200, b"<html>PRIVATE_RESPONSE</html>", {"X-Private": "PRIVATE_HEADER"}))
+        with self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
+            with self.assertRaises(ApiError) as raised:
+                credentials.make_request(
+                    "POST", "/Commands/SetColor/987654?token=PRIVATE_QUERY",
+                    json={"private": "PRIVATE_REQUEST"}, allow_empty_response=True,
+                )
+        self.assertEqual(raised.exception.code, 200)
+        self.assertIn("/Commands/SetColor", str(raised.exception))
+        self.assertIn("HTTP 200", str(raised.exception))
+        diagnostics = "\n".join([str(raised.exception), *captured.output])
+        for secret in ("PRIVATE_", "987654", "audit-token", "audit-refresh"):
+            self.assertNotIn(secret, diagnostics)
+        self.assertEqual(len(self.sent), 1)
 
     def test_authenticate_wire_contract_matches_inherited_payload(self):
         device_id = credentials_module.uuid.UUID("12345678-1234-4234-8234-123456789abc")
