@@ -231,6 +231,8 @@ class ModelTests(unittest.TestCase):
             [("turn_on", ()), ("set_brightness", (11,))],
             [("turn_on", ()), ("set_color", (False,))],
             [("turn_on", ()), ("turn_off", (1,))],
+            [("turn_on", ()), ("reset_legacy_color", (1,))],
+            [("turn_on", ()), ("stop_effect", ())],
             [("turn_on", ()), ("set_color", 4)],
             [("turn_on", ()), ("turn_off",)],
             None,
@@ -243,6 +245,104 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             self.location.execute_commands(TargetKey(999999, "Zone", 101), [("turn_on", ())])
         self.assertEqual(len(self.api.calls), sent)
+
+    def test_legacy_color_reset_changes_only_the_historical_color_ids(self):
+        for color_id in (12, 17, 24, 1, 8, 11, 13, 30, None, 999):
+            with self.subTest(color_id=color_id):
+                self.api.zones = [zone(isOn=False, colorId=color_id)]
+                previous = self.location.refresh_and_snapshot(True)
+                before = len(self.api.calls)
+                snapshot = self.location.execute_commands(
+                    self.zone_key, [("reset_legacy_color", ()), ("turn_on", ())]
+                )
+                expected = []
+                if color_id in (12, 17, 24):
+                    expected.append(("/Commands/SetColor", {
+                        "id": 101, "type": "Zone", "colorId": 1,
+                    }))
+                expected.append(("/Commands/On", {"id": 101, "type": "Zone"}))
+                self.assertEqual(
+                    [(path, kwargs["json"]) for method, path, kwargs in self.api.calls[before:]],
+                    expected,
+                )
+                state = snapshot[self.zone_key]
+                self.assertEqual(state.color_id, 1 if color_id in (12, 17, 24) else color_id)
+                self.assertEqual(state.brightness, 128)
+                self.assertTrue(state.is_on)
+                self.assertEqual(snapshot[self.group_key], previous[self.group_key])
+
+    def test_legacy_color_reset_rejects_native_patterns_without_sending_on(self):
+        for key in (self.zone_key, self.group_key):
+            for color_id in (33, 34, 35):
+                with self.subTest(kind=key.kind, color_id=color_id):
+                    self.api.zones = [zone(isOn=False, colorId=color_id)]
+                    self.api.groups = [group(isOn=False, colorId=color_id)]
+                    previous = self.location.refresh_and_snapshot(True)
+                    before = len(self.api.calls)
+                    with self.assertRaisesRegex(
+                        ApiError, "Native Haven pattern controls are not supported; use the Haven app"
+                    ):
+                        self.location.execute_commands(
+                            key, [("reset_legacy_color", ()), ("turn_on", ())]
+                        )
+                    self.assertEqual(len(self.api.calls), before)
+                    self.assertEqual(self.location.snapshot, previous)
+
+    def test_legacy_color_reset_uses_the_preceding_commands_state(self):
+        cases = (
+            (11, ("set_color", (12,)), [12, 1], 1),
+            (12, ("set_color", (25,)), [25], 25),
+            (33, ("set_color", (12,)), [12, 1], 1),
+            (34, ("set_color", (25,)), [25], 25),
+            (35, ("set_white", ()), [1], 1),
+            (6, ("set_white", ()), [6], 6),
+        )
+        for initial, preceding, expected_colors, expected in cases:
+            with self.subTest(initial=initial, preceding=preceding):
+                self.api.zones = [zone(isOn=False, colorId=initial)]
+                self.location.refresh_devices(True)
+                before = len(self.api.calls)
+                snapshot = self.location.execute_commands(self.zone_key, [
+                    preceding, ("reset_legacy_color", ()), ("turn_on", ()),
+                ])
+                colors = [kwargs["json"]["colorId"]
+                          for _method, path, kwargs in self.api.calls[before:]
+                          if path == "/Commands/SetColor"]
+                self.assertEqual(colors, expected_colors)
+                self.assertEqual(snapshot[self.zone_key].color_id, expected)
+                self.assertTrue(snapshot[self.zone_key].is_on)
+
+    def test_legacy_color_reset_preflights_prior_commands_before_any_request(self):
+        for color_id in (33, 34, 35):
+            for change_color in (False, True):
+                with self.subTest(color_id=color_id, change_color=change_color):
+                    self.api.zones = [zone(isOn=False, colorId=11 if change_color else color_id)]
+                    previous = self.location.refresh_and_snapshot(True)
+                    before = len(self.api.calls)
+                    commands = [("set_color", (color_id,))] if change_color else []
+                    commands += [
+                        ("set_brightness", (8,)), ("reset_legacy_color", ()), ("turn_on", ()),
+                    ]
+                    with self.assertRaisesRegex(
+                        ApiError, "Native Haven pattern controls are not supported; use the Haven app"
+                    ):
+                        self.location.execute_commands(self.zone_key, commands)
+                    self.assertEqual(len(self.api.calls), before)
+                    self.assertEqual(self.location.snapshot, previous)
+
+    def test_failed_legacy_color_reset_does_not_send_on_or_publish_white(self):
+        self.api.zones = [zone(isOn=False, colorId=12)]
+        previous = self.location.refresh_and_snapshot(True)
+        before = len(self.api.calls)
+        self.api.command_error = ApiError("Rejected reset", code=400)
+        with self.assertRaisesRegex(ApiError, "Rejected reset"):
+            self.location.execute_commands(
+                self.zone_key, [("reset_legacy_color", ()), ("turn_on", ())]
+            )
+        self.assertEqual([path for _method, path, _kwargs in self.api.calls[before:]], [
+            "/Commands/SetColor",
+        ])
+        self.assertEqual(self.location.snapshot, previous)
 
     def test_batch_preserves_completed_state_after_a_later_command_failure(self):
         before = self.location.refresh_and_snapshot(True)

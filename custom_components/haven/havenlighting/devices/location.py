@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any, ClassVar
 
-from ..colors import EFFECT_BY_ID, HAVEN_KELVIN_MAP
+from ..colors import HAVEN_KELVIN_MAP, LEGACY_EFFECT_COLOR_IDS, PATTERN_BY_ID
 from ..credentials import Credentials
 from ..exceptions import ApiError
 from ..models import LightState, LocationData, TargetKey
@@ -102,7 +102,7 @@ class Location:
             raise ApiError("Haven command target belongs to a different location")
         allowed = {
             "turn_on": 0, "turn_off": 0, "set_brightness": 1, "set_color": 1,
-            "stop_effect": 0, "set_white": 0,
+            "reset_legacy_color": 0, "set_white": 0,
         }
         prepared = []
         try:
@@ -129,13 +129,23 @@ class Location:
                 target = self._lights.get(key)
             if target is None:
                 raise ApiError("Haven target is no longer in this location's inventory")
+            # Check state-dependent resets before sending anything. Earlier
+            # color commands can enter or leave a pattern within this batch.
+            pattern_active = target.color_id in PATTERN_BY_ID
             for name, arguments in prepared:
-                if name == "stop_effect":
-                    # Resolve under the same lock as prior commands and polls.
-                    # A static preset stops an active effect; a newer static
-                    # color must remain unchanged. There is no separate known
-                    # Haven effect-stop endpoint.
-                    if target.color_id in EFFECT_BY_ID:
+                if name == "set_color":
+                    pattern_active = arguments[0] in PATTERN_BY_ID
+                elif name == "set_white":
+                    pattern_active = False
+                elif name == "reset_legacy_color" and pattern_active:
+                    raise ApiError(
+                        "Native Haven pattern controls are not supported; use the Haven app"
+                    )
+            for name, arguments in prepared:
+                if name == "reset_legacy_color":
+                    # Preserve the old color-reset behavior against execution-
+                    # time state, without pretending it stops a native pattern.
+                    if target.color_id in LEGACY_EFFECT_COLOR_IDS:
                         target.set_color(HAVEN_KELVIN_MAP[2700])
                 else:
                     getattr(target, name)(*arguments)

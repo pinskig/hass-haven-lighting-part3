@@ -7,7 +7,14 @@ import re
 import secrets
 from typing import Any
 
-from .havenlighting.colors import EFFECT_BY_ID, HAVEN_EFFECT_MAP, KELVIN_BY_ID, RGB_BY_ID
+from .havenlighting.colors import (
+    COLOR_BY_ID,
+    HAVEN_COLOR_MAP,
+    HAVEN_PATTERN_MAP,
+    KELVIN_BY_ID,
+    PATTERN_BY_ID,
+    RGB_BY_ID,
+)
 from .havenlighting.models import LightState, TargetKey
 
 
@@ -41,14 +48,16 @@ def action_description(
     effect = values.get("effect")
     if turn_off:
         mode = "off"
-    elif isinstance(effect, str) and effect in HAVEN_EFFECT_MAP:
-        mode = "effect"
+    elif isinstance(effect, str) and effect in HAVEN_COLOR_MAP:
+        mode = "color_preset"
     elif "color_temp_kelvin" in values:
         mode = "color_temp"
     elif "rgb_color" in values:
         mode = "rgb"
     elif effect == "off":
-        mode = "effect_off"
+        mode = "legacy_color_reset"
+    elif isinstance(effect, str) and effect in HAVEN_PATTERN_MAP:
+        mode = "effect"
     elif "brightness" in values:
         mode = "brightness"
     else:
@@ -64,8 +73,12 @@ def action_description(
         "kelvin": _number(values.get("color_temp_kelvin")),
         "rgb": tuple(rgb) if rgb is not None else None,
         "brightness": _number(values.get("brightness")),
+        # The old effect input also accepts named colors. Describe that
+        # compatibility path without presenting the color as a native pattern.
+        "color_preset": effect
+        if isinstance(effect, str) and effect in HAVEN_COLOR_MAP else None,
         "effect": effect
-        if isinstance(effect, str) and effect in (*HAVEN_EFFECT_MAP, "off") else None,
+        if isinstance(effect, str) and effect in HAVEN_PATTERN_MAP else None,
         "context": private_reference(getattr(context, "id", None)),
         "parent": private_reference(getattr(context, "parent_id", None)),
         "has_user": bool(getattr(context, "user_id", None)),
@@ -76,6 +89,7 @@ def sanitize_action_description(values: dict[str, Any] | None) -> dict[str, Any]
     """Enforce the allowlist again at the logger boundary, including new callers."""
     values = values if isinstance(values, dict) else {}
     mode = values.get("mode")
+    color_preset = values.get("color_preset")
     effect = values.get("effect")
     rgb = values.get("rgb")
     if not (
@@ -92,12 +106,16 @@ def sanitize_action_description(values: dict[str, Any] | None) -> dict[str, Any]
     brightness = _number(values.get("brightness"))
     return {
         "mode": mode if isinstance(mode, str) and mode in {
-            "off", "on", "color_temp", "rgb", "effect", "effect_off", "brightness"
+            "off", "on", "color_temp", "rgb", "color_preset", "effect",
+            "legacy_color_reset", "brightness",
         } else "unknown",
         "kelvin": kelvin if kelvin is not None and kelvin <= 10000 else None,
         "rgb": tuple(rgb) if rgb is not None else None,
         "brightness": brightness if brightness is not None and brightness <= 255 else None,
-        "effect": effect if isinstance(effect, str) and effect in (*HAVEN_EFFECT_MAP, "off") else None,
+        "color_preset": color_preset
+        if isinstance(color_preset, str) and color_preset in HAVEN_COLOR_MAP else None,
+        "effect": effect
+        if isinstance(effect, str) and effect in HAVEN_PATTERN_MAP else None,
         "context": reference("context"),
         "parent": reference("parent"),
         "has_user": values.get("has_user") is True,
@@ -113,7 +131,8 @@ def command_description(commands: list[tuple[str, tuple]]) -> list[tuple[str, tu
             continue
         name, arguments = specification
         safe_name = name if isinstance(name, str) and name in {
-            "turn_on", "turn_off", "set_color", "set_brightness", "stop_effect", "set_white"
+            "turn_on", "turn_off", "set_color", "set_brightness",
+            "reset_legacy_color", "set_white",
         } else "unknown"
         safe_arguments = (
             tuple(_number(value) for value in arguments)
@@ -129,8 +148,8 @@ def state_description(state: LightState | None) -> dict[str, Any] | None:
     color_id = state.color_id
     mode = (
         "color_temp" if color_id in KELVIN_BY_ID else
-        "rgb" if color_id in RGB_BY_ID else
-        "brightness" if color_id in EFFECT_BY_ID else "unknown"
+        "rgb" if color_id in COLOR_BY_ID else
+        "brightness" if color_id in PATTERN_BY_ID else "unknown"
     )
     return {
         "on": state.is_on,
@@ -139,5 +158,6 @@ def state_description(state: LightState | None) -> dict[str, Any] | None:
         "mode": mode,
         "kelvin": KELVIN_BY_ID.get(color_id),
         "rgb": RGB_BY_ID.get(color_id),
-        "effect": EFFECT_BY_ID.get(color_id),
+        "color_preset": COLOR_BY_ID.get(color_id),
+        "effect": PATTERN_BY_ID.get(color_id),
     }

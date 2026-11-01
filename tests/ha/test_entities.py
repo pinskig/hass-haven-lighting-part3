@@ -119,31 +119,54 @@ async def test_color_state_follows_server_snapshot(
 
 
 @pytest.mark.parametrize(
-    ("color_id", "effect"), [(12, "Fire"), (17, "Sunset"), (24, "Ocean")]
+    ("color_id", "rgb"),
+    [(12, (255, 21, 0)), (17, (255, 120, 0)), (24, None)],
 )
-async def test_effect_state_preserves_brightness(
-    hass, loaded_entry, haven_api, color_id, effect
+async def test_named_color_state_preserves_brightness(
+    hass, loaded_entry, haven_api, color_id, rgb
 ):
     coordinator = hass.data["haven"][loaded_entry.entry_id]["coordinators"][0]
     haven_api.zones[0].update(isOn=True, lightBrightnessId=5, colorId=color_id)
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     state = hass.states.get(entity_for(hass))
-    assert state.attributes["effect"] == effect
-    assert state.attributes["color_mode"] == "brightness"
+    assert state.attributes["effect"] is None
+    assert state.attributes["effect_list"] is None
+    assert state.attributes["color_mode"] == "rgb"
     assert state.attributes["brightness"] == 128
-    assert state.attributes["rgb_color"] is None
+    assert state.attributes["rgb_color"] == rgb
     assert state.attributes["color_temp_kelvin"] is None
 
-    # A brightness command must keep the effect and its published brightness.
+    # Brightness changes preserve the exact static preset and its RGB metadata.
     await hass.services.async_call(
         "light", "turn_on", {"entity_id": state.entity_id, "brightness": 204}, blocking=True
     )
     state = hass.states.get(state.entity_id)
-    assert state.attributes["effect"] == effect
-    assert state.attributes["color_mode"] == "brightness"
+    assert state.attributes["effect"] is None
+    assert state.attributes["color_mode"] == "rgb"
+    assert state.attributes["rgb_color"] == rgb
     assert state.attributes["brightness"] == 204
     assert haven_api.zones[0]["colorId"] == color_id
+
+
+@pytest.mark.parametrize(
+    ("color_id", "pattern"),
+    [(33, "Warm Colors"), (34, "Cool Colors"), (35, "All Colors")],
+)
+async def test_native_pattern_inventory_reports_name_without_advertising_controls(
+    hass, loaded_entry, haven_api, color_id, pattern
+):
+    coordinator = hass.data["haven"][loaded_entry.entry_id]["coordinators"][0]
+    haven_api.zones[0].update(isOn=True, lightBrightnessId=5, colorId=color_id)
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    state = hass.states.get(entity_for(hass))
+    assert state.attributes["effect"] == pattern
+    assert state.attributes["effect_list"] is None
+    assert state.attributes["color_mode"] == "brightness"
+    assert state.attributes["brightness"] == 128
+    assert state.attributes["rgb_color"] is None
+    assert state.attributes["color_temp_kelvin"] is None
 
 
 @pytest.mark.parametrize("color_id", [None, 999])

@@ -4,7 +4,7 @@ A Home Assistant integration for Haven Lighting cloud-connected landscape lighti
 
 This project was forked from [Stephen Crescenti's Haven Lighting Redux](https://github.com/screscenti/hass-haven-lighting-redux) on **April 19, 2026**. Redux supplied the 2025 Haven API rewrite and built on [Mickey Schwab's original integration](https://github.com/mickeyschwab/haven-hass). Part 3 builds on that foundation with shared polling, account-wide request protection, safer state and device handling, and automated regression coverage. The [development history](#ai-assisted-development-since-the-fork) records the changes made since the fork.
 
-**Current integration version: 1.0.14** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
+**Current integration version: 1.0.15** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
 
 [Features](#features-and-current-scope) · [Installation](#installation-and-configuration) · [Request handling](#polling-and-request-handling) · [Automations](#automations) · [Troubleshooting](#troubleshooting) · [Change history](#ai-assisted-development-since-the-fork) · [Development tests](#development-tests)
 
@@ -17,18 +17,21 @@ The integration discovers the Haven account's **default location** and exposes i
 | Zones and groups | Control zones and groups separately, including targets whose numeric IDs overlap. Individual fixtures outside those zone/group records are not exposed separately. |
 | Power | Turn zones and groups on or off. |
 | Brightness | Home Assistant brightness is mapped to **10 nonzero Haven levels**; zero turns the target off. |
-| RGB color | RGB input selects the nearest of **17 configured Haven color presets**. Exact RGB white `[255, 255, 255]` selects a white preset instead; see below. |
+| RGB color | RGB input selects the nearest of **19 configured Haven color swatches**. Exact RGB white `[255, 255, 255]` selects a white preset instead; see below. The API receives a preset ID, not RGB. |
 | White temperature | Selects the nearest configured preset: **2700, 3000, 3500, 3700, 4000, 4400, 4700, or 5000 K**. |
 | Exact white presets | Each zone/group has a **White temperature** dropdown with those eight choices. Selecting one sends its exact Haven color ID and turns the target on, preserving brightness. |
-| Effects | **Fire, Sunset, and Ocean**, with brightness reported while an effect is active. |
+| Exact named colors | Each zone/group has a **Color preset** dropdown with 20 named static colors, including **Fire, Sunset, and Ocean**. Selection sends the exact Haven color ID and preserves brightness. |
+| Native patterns | **All Colors, Warm Colors, and Cool Colors** are recognized in reported inventory. Pattern selection and rate controls are not implemented because their write contract remains unverified. |
 | Inventory changes | New zones/groups appear on later refreshes, including after an initially empty inventory. Missing targets retain their registry entries and become unavailable. |
-| State reporting | Validated snapshots report power, brightness, RGB/white mode, and effects. Unchanged polls avoid redundant Home Assistant state writes. |
+| State reporting | Validated snapshots distinguish static colors, white presets, and native patterns, with power and brightness. Unchanged polls avoid redundant Home Assistant state writes. |
 
 Discovery currently uses the account's default location; it does not enumerate every location or provide a location selector. The brightness and color mappings above describe this integration's API controls, rather than continuous dimming or arbitrary RGB output.
 
 The palette is not discovered from each device's capabilities. White requests use Haven's existing white preset IDs through `SetColor`; the integration does not substitute RGB white or claim an arbitrary-Kelvin API. A request for **3200 K**, for example, maps to **3000 K**, which is the temperature subsequently reported to Home Assistant. Fixed-white and other products may have different capabilities; the current inventory responses do not establish a per-model capability contract.
 
 The white IDs were checked against the Haven `colorDefinitions` response captured during the maintainer's Homey work on **May 26, 2025**. Version 1.0.14 corrects preset **6** from the inherited **4100 K** label to **4400 K**, without changing its numeric ID. This also corrects nearest-preset rounding: a 4100 K request now selects 4000 K. An exact midpoint selects the lower temperature.
+
+Version 1.0.15 corrects the inherited classification of **Fire, Sunset, and Ocean**: they are static colors. The misleading light effect dropdown is hidden. Their existing `effect:` action arguments remain accepted as compatibility aliases so saved automations continue to select the same numeric IDs.
 
 ## Installation and configuration
 
@@ -37,13 +40,13 @@ The white IDs were checked against the Haven `colorDefinitions` response capture
 3. Download **Haven Lighting Part 3**, then restart Home Assistant.
 4. Go to **Settings → Devices & Services → Add Integration**.
 5. Search for **Haven Lighting Part 3** and enter your Haven account email and password.
-6. After setup, zones and groups from the default location appear as light entities with a companion White temperature control on each device.
+6. After setup, zones and groups from the default location appear as light entities with companion **White temperature** and **Color preset** controls on each device.
 
 Setup prevents duplicate active entries for the same normalized email address. If credentials expire, use the integration's reauthentication prompt to update them.
 
 ### Updating an existing installation
 
-Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.14**. A full Home Assistant restart loads the downloaded Python code; reloading the integration alone does not establish that the running code has changed.
+Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.15**. A full Home Assistant restart loads the downloaded Python code; reloading the integration alone does not establish that the running code has changed.
 
 The registry migration introduced in 1.0.7 gives targets identifiers that distinguish their account, location, and zone/group type. When a legacy target's identity can be established, migration preserves its entity ID, device ID, custom names, and area assignments. Existing automations retain their references for successfully migrated targets. Migration also handles a legacy target that first reappears after setup.
 
@@ -68,9 +71,36 @@ Open **Settings → Devices & Services → Haven Lighting Part 3**, choose the z
 
 Selecting white sends the existing temperature action through the linked light entity, which sends **SetColor → On**. It preserves brightness and uses the same account budget, action diagnostics, and polling as the light. The original light entity and automation references remain valid. Keep that light entity enabled; the dropdown reports an error if its linked light is disabled or missing.
 
-The dropdown follows the shared reported preset, including changes made in the Haven app. It is **unknown** while a nonwhite color/effect or an unrecognized preset is selected, and **unavailable** when its target disappears or the coordinator is unavailable. It does not remember an old white choice as though it were still active.
+The dropdown follows the shared reported preset, including changes made in the Haven app. It is **unknown** while a nonwhite color, native pattern, or unrecognized preset is selected, and **unavailable** when its target disappears or the coordinator is unavailable. It does not remember an old white choice as though it were still active.
 
-The existing temperature slider remains supported and snaps to the nearest preset. Exact RGB white `[255, 255, 255]` now retains the white preset active when the command executes, or selects **2700 K** when coming from a color, effect, or unknown preset. Other RGB values still use the inherited color approximation: near-white RGB is not a reliable way to request a particular white temperature. Use the dropdown or an explicit `color_temp_kelvin` action for that purpose.
+The existing temperature slider remains supported and snaps to the nearest preset. Exact RGB white `[255, 255, 255]` now retains the white preset active when the command executes, or selects **2700 K** when coming from a color, native pattern, or unknown preset. Other RGB values use color approximation: near-white RGB is not a reliable way to request a particular white temperature. Use the dropdown or an explicit `color_temp_kelvin` action for that purpose.
+
+### Selecting named colors
+
+Use the device's **Color preset** dropdown to select a static color directly. Its names and IDs come from the `settings.colors` response captured during the May 26, 2025 Homey work:
+
+| Color | Haven ID | Color | Haven ID |
+| --- | --- | --- | --- |
+| Red | 11 | Green | 21 |
+| Fire | 12 | Sea Foam | 22 |
+| Pumpkin | 13 | Turquoise | 23 |
+| Amber | 14 | Ocean | 24 |
+| Tangerine | 15 | Deep Blue | 25 |
+| Merigold | 16 | Violet | 26 |
+| Sunset | 17 | Purple | 27 |
+| Yellow | 18 | Lavender | 28 |
+| Lime | 19 | Pink | 29 |
+| Light Green | 20 | Hot Pink | 30 |
+
+This is the recovered palette, not a newly downloaded capability list. A newer Haven app can show additional or differently named colors; those labels need their own verified IDs before being added or renamed here. The selector uses the same linked light service, credentials, request budget, and polling as White temperature. Both selectors follow the single current preset: while white is active, Color preset is unknown; while a static color is active, White temperature is unknown.
+
+The recovered `colorDefinitions` also supplies Fire's **`[255, 21, 0]`** and Sunset's **`[255, 120, 0]`** display swatches. Version 1.0.15 uses them in both mapping directions, so Home Assistant can capture and restore these static colors through RGB. Adding them also changes which preset wins for some nearby RGB inputs. Named selection always uses the exact ID. Ocean's name/ID is verified, but its RGB swatch was not present in the recovered definitions; the integration leaves that value unknown. See the scene guidance below.
+
+### Native patterns
+
+The Haven app's Pattern tab lists **All Colors**, **Warm Colors**, and **Cool Colors**, with a separate rate control. The recovered settings map those names to **35**, **33**, and **34**, respectively. Those IDs identify inventory state; they do not establish a working pattern/rate command. The recovered older pattern attempt returned `success: false`, and the reviewed upstream projects do not supply a verified replacement.
+
+Use the Haven app to select or configure native patterns for now. Part 3 reports their names when inventory returns those IDs, but rejects requests to start them rather than claiming success. `effect: "off"` is only a compatibility reset for the old static-color aliases; it does not represent a verified native-pattern stop command.
 
 ## Polling and request handling
 
@@ -90,7 +120,7 @@ Failed command batches preserve the existing refresh schedule, including when br
 
 Rapid color or temperature selections can queue faster than the account budget permits the corresponding `SetColor` and `On` requests. Deterministic tests reproduce older selections completing after newer selections have already been submitted. The observed 1.0.12 log contained successful HTTP responses and repeated color/On sequences, but did not contain the requested Kelvin values, service contexts, or reported states needed to prove a feedback loop or identify every source of the commands.
 
-**Version 1.0.14 does not coalesce or drop queued service calls.** A prototype investigated for 1.0.13 admitted newer color intents early but changed how Home Assistant resolved a queued `light.toggle`: it could read old power state and issue On instead of Off. The release retains Home Assistant's existing service semaphore and the location/account locks. The white dropdown delegates to the same light service instead of independently changing power through a second platform. A safe future coalescer must preserve the original intent of relative actions, including toggle and brightness steps, before Home Assistant converts them to absolute commands. Private coroutine inspection and global service overrides are not used.
+**Version 1.0.15 does not coalesce or drop queued service calls.** A prototype investigated for 1.0.13 admitted newer color intents early but changed how Home Assistant resolved a queued `light.toggle`: it could read old power state and issue On instead of Off. The release retains Home Assistant's existing service semaphore and the location/account locks. Both preset dropdowns delegate to the same light service instead of independently changing power through a second platform. A safe future coalescer must preserve the original intent of relative actions, including toggle and brightness steps, before Home Assistant converts them to absolute commands. Private coroutine inspection and global service overrides are not used.
 
 The diagnostics below distinguish service waiting, requested values, preset mapping, optimistic acknowledgments, and later inventory state. Snapping once to a configured preset is expected; repeated movement through older selections or movement after a later inventory read requires those records to identify the cause. Later valid inventory reports remain authoritative, so genuine changes from the Haven app are not permanently hidden.
 
@@ -146,9 +176,39 @@ data:
   brightness: 128
 ```
 
-Replace `light.front_yard` with your entity ID. To select an effect, use `effect: Ocean`, `effect: Fire`, or `effect: Sunset`. To stop an active effect, use `effect: "off"`; without a replacement RGB color or white temperature, this selects **2700 K white** if an effect is still active when the command executes. An existing static color is preserved. Version 1.0.13 makes this decision under the operation lock, after preceding commands, so a queued effect-off action neither misses a newly started effect nor overwrites a newer static color. It does not restore a previous color or turn the light off.
+For an exact named color, use the new selector:
 
-Color-, temperature-, and effect-only turn-on actions explicitly request power on, even if the last poll reported the target on. This handles a light switched off by the Haven app or a schedule between polls. It adds one paced request when the light was already on. A nonzero brightness command already requests power on; zero brightness turns the target off.
+```yaml
+action: select.select_option
+target:
+  entity_id: select.front_yard_color_preset
+data:
+  option: "Fire"
+```
+
+Replace example entity IDs with your own. Existing `light.turn_on` calls using `effect: Fire`, `effect: Sunset`, or `effect: Ocean` remain supported as static-color aliases. The name of this legacy HA field does not make these Haven patterns. The selector uses the same compatibility path internally to preserve the light service's serialization.
+
+For compatibility, `effect: "off"` without replacement RGB or Kelvin selects **2700 K white** only if the execution-time preset is Fire, Sunset, or Ocean. Other static colors and white presets are preserved. A native pattern causes a clear unsupported-operation error before sending the batch, including a combined brightness/reset request. This alias does not restore a previous color or turn the light off. Prefer an explicit white preset when the intent is white, and `light.turn_off` when the intent is power off.
+
+Color- and temperature-only turn-on actions explicitly request power on, even if the last poll reported the target on. This handles a light switched off by the Haven app or a schedule between polls. It adds one paced request when the light was already on. A nonzero brightness command already requests power on; zero brightness turns the target off.
+
+### Scenes and the missing Ocean swatch
+
+New light-only scene snapshots restore Fire and Sunset through their verified RGB swatches. Ocean has no verified RGB value, so a new light-only snapshot containing `color_mode: rgb` with a null `rgb_color` cannot be reproduced by Home Assistant. Previously saved Ocean scenes using the legacy `effect: Ocean` attribute still work.
+
+For Ocean, use an explicit named-color automation, or a scene that selects the color and separately specifies light power/brightness without color attributes:
+
+```yaml
+scene:
+  - name: Haven Ocean
+    entities:
+      select.front_yard_color_preset: "Ocean"
+      light.front_yard:
+        state: "on"
+        brightness: 128
+```
+
+The light state is needed because scene reproduction skips a selector whose option is already Ocean, even when the light is off. Do not add `color_mode` or `rgb_color` to this explicit light state. This limitation can be removed when a trustworthy Ocean swatch is available; the integration does not invent one.
 
 ## Troubleshooting
 
@@ -161,9 +221,11 @@ Color-, temperature-, and effect-only turn-on actions explicitly request power o
 | Entities become unavailable | Check the logs for authentication, connection, payload-validation, or cooldown errors. Failed refreshes retain cached data; targets absent from a successful inventory remain unavailable. |
 | Credentials have expired | Complete the integration's reauthentication flow. |
 | Retired targets remain listed | Registry entries are preserved to protect customization and automation references. Remove permanently retired devices through Home Assistant when appropriate. |
-| Color or brightness differs from the requested value | Check the preset and brightness mappings in the feature table. Use White temperature for an exact white preset; near-white RGB selections still use color approximation. |
-| White temperature is unknown | The reported preset is currently a color/effect or is not in the white map. Select one of the eight white options to change it. |
-| The temperature control marker moves after release | One snap to the nearest configured preset is expected. Rapid adjustments can still create a command backlog in 1.0.14. The exact dropdown avoids continuous dragging. Capture action and poll diagnostics to distinguish queued selections from a later inventory report; physical output and the browser marker still need installation testing. |
+| Color or brightness differs from the requested value | Check the preset and brightness mappings in the feature table. Use Color preset or White temperature for exact selection; near-white RGB selections still use color approximation. An acknowledgment or inventory ID does not prove physical output. |
+| White temperature or Color preset is unknown | The active preset belongs to the other selector, is a native pattern, or is unmapped. The selectors show current state rather than remembering a stale selection. |
+| Fire/Sunset/Ocean disappeared from the effect menu | Version 1.0.15 corrects their classification. Use Color preset. Existing named `effect:` actions remain compatible. |
+| A new Ocean scene does not restore | Its RGB swatch is unknown. Use the explicit selector/power scene above or a named-color automation. |
+| The temperature control marker moves after release | One snap to the nearest configured preset is expected. Rapid adjustments can still create a command backlog in 1.0.15. The exact dropdown avoids continuous dragging. Capture action and poll diagnostics to distinguish queued selections from a later inventory report; physical output and the browser marker still need installation testing. |
 | A light action fails with `Expecting value: line 1 column 1 (char 0)` | Version 1.0.10 fixes this error when a light command receives an empty successful response. Update and restart Home Assistant. A nonempty invalid response still fails, with an error identifying the endpoint family and HTTP status; include that message when reporting a remaining problem. |
 | Logs warn that Haven uses `device_registry.devices` as a mapping | Version 1.0.11 uses the supported registry iteration on newer Home Assistant versions while retaining compatibility with older versions. This warning is separate from command-response parsing errors. |
 | An API redirect is rejected | Check the configured API environment. Fixed endpoints reject redirects so login bodies are not forwarded and additional requests cannot bypass pacing. |
@@ -181,7 +243,7 @@ logger:
 Version 1.0.13 adds an action trace to the HTTP-attempt records introduced in 1.0.8 and extended in 1.0.12. Example format, with illustrative values:
 
 ```text
-Haven HTTP attempt: method=POST endpoint=/Commands/SetColor status=200 elapsed=0.250s version=1.0.14 response_bytes=0 trace=012345abcdef
+Haven HTTP attempt: method=POST endpoint=/Commands/SetColor status=200 elapsed=0.250s version=1.0.15 response_bytes=0 trace=012345abcdef
 ```
 
 Each record represents an actual HTTP transport attempt and includes its method, fixed endpoint-family label, status or transport-failure marker, elapsed time, imported integration version, response byte count, and trace. Timing excludes waiting for serialization or pacing. The byte count describes the already-read body after any HTTP content decoding; `unavailable` means no response was returned. These records omit credentials, tokens, headers, body contents, target IDs, and query values. A locally rejected cooldown call produces no HTTP-attempt record. A transport failure does not establish that the request reached Haven. `trace=-` means the request occurred outside a traced entity action or poll, such as initial authentication.
@@ -191,23 +253,23 @@ The same opt-in DEBUG setting also enables these records:
 | Record | Meaning |
 | --- | --- |
 | `Haven action: phase=service_received` / `service_finished` | Boundary of HA's service wrapper, including its semaphore wait. HA 2024.1 single-entity calls bypass this hook. Finished includes errors or cancellation; only `accepted` identifies an acknowledged batch. |
-| `Haven action: phase=received` | Entity-level requested mode, Kelvin/RGB/brightness/effect, mapped command list, running HA and integration versions, and anonymous context/parent links. |
+| `Haven action: phase=received` | Entity-level requested mode, Kelvin/RGB/brightness/named color, mapped command list, running HA and integration versions, and anonymous context/parent links. Named aliases use `mode=color_preset`; old `effect: off` uses `mode=legacy_color_reset`. |
 | `Haven action: phase=started` | Coordinator execution begins; `queue_wait` measures only the wait since entity-level receipt, not an earlier HA semaphore wait. |
 | `Haven action: phase=accepted` / `error` | Before/after cached state, elapsed time, and `source=optimistic`; errors include HTTP status when available and whether cooldown blocked HTTP locally. |
-| `Haven poll` / `Haven poll state` | A separate trace links the two inventory GETs to their reported state, including mode, preset ID and Kelvin, with `source=inventory`. |
+| `Haven poll` / `Haven poll state` | A separate trace links the two inventory GETs to their reported state, including mode, preset ID, Kelvin, and `color_preset`, with `source=inventory`. Only native patterns populate the diagnostic `effect` field. |
 | `Haven color configuration` | The entity's configured supported modes and white presets, explicitly labeled `capability_source=inherited_presets`. |
 
 Action traces propagate into executor work, linking SetColor and On to the same action. Target, context, and parent references use a random process-local keyed hash; the new records contain no raw account, entity, device, context, or user IDs. A boolean records whether a user context exists. These links can help compare manual actions and automation chains, but do not by themselves identify a particular automation or prove a loop. They change after restart. Existing Home Assistant/framework messages and other integrations may contain identifying information; review the complete log before sharing it.
 
-After updating and restarting Home Assistant, enable debug logging and look for `version=1.0.14` in a new HTTP-attempt record. This value comes from the imported client code, rather than rereading the downloaded manifest during each request. A successful command with `response_bytes=0` has an empty acknowledgment; a parsing error with a nonzero count needs further investigation without assuming that the body was empty.
+After updating and restarting Home Assistant, enable debug logging and look for `version=1.0.15` in a new HTTP-attempt record. This value comes from the imported client code, rather than rereading the downloaded manifest during each request. A successful command with `response_bytes=0` has an empty acknowledgment; a parsing error with a nonzero count needs further investigation without assuming that the body was empty.
 
-### Manual temperature check
+### Manual color and temperature check
 
-1. Redownload the update, fully restart Home Assistant, and verify a new request log says `version=1.0.14`. Record the actual Home Assistant version and Haven device/controller model.
-2. Enable debug logging. Select red, then use the device's **White temperature** dropdown to select **2700 K**. Check the physical light and Home Assistant's active color mode and temperature. The action should map to `set_color(1)` followed by `turn_on`.
+1. Redownload the update, fully restart Home Assistant, and verify a new request log says `version=1.0.15`. Record the actual Home Assistant version and Haven device/controller model.
+2. Enable debug logging. Use **Color preset → Fire** and expect `set_color(12)` followed by `turn_on`. Then use **White temperature → 2700 K** and expect `set_color(1)` followed by `turn_on`. Check the physical light for both changes and compare Home Assistant's active preset/mode after reconciliation.
 3. Select **4400 K** and **5000 K** separately and expect IDs 6 and 8. Change only brightness and verify temperature mode is preserved. With the existing temperature slider or a service action, try **3200 K** and expect **3000 K**.
 4. Make a short series of rapid temperature changes, ending on **2700 K**. Stop interacting and let outstanding actions and a successful inventory refresh finish. Note whether the marker moves during command completion or only after the poll. This release still executes intermediate selections.
-5. Try Fire followed by effect-off, and Fire followed by a static color and effect-off. Expect 2700 K in the first case and the selected static color in the second. Test an ordinary Off action separately.
+5. Change only brightness while Fire is selected and confirm that the preset remains Fire. Test an ordinary Off action separately. If existing automations use legacy `effect:` inputs, test Fire followed by `effect: "off"`, then Fire → Deep Blue → `effect: "off"`. Expect 2700 K in the first case and Deep Blue in the second.
 6. Change the light in the Haven app, then allow a successful HA inventory refresh. Confirm that the external change appears without new command POSTs generated by the refresh.
 7. Disable debug logging and save the relevant log excerpt, along with the exact action sequence, expected final temperature, observed marker behavior, and whether the physical light matched it. Include service/action/poll traces rather than only the WebSocket error wrapper.
 
@@ -217,9 +279,11 @@ For an unresolved problem, [open an issue](https://github.com/pinskig/hass-haven
 
 ## AI-assisted development since the fork
 
-Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.14, including earlier approaches that later releases replaced.
+Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.15, including earlier approaches that later releases replaced.
 
-The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, effect commands, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.13 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
+The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, named-color commands through HA's effect argument, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.13 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
+
+Earlier releases called Fire, Sunset, and Ocean effects, following the inherited implementation. That classification was incorrect; the historical effect/off changes below describe their old HA interface. Version 1.0.15 distinguishes those static colors from Haven's native patterns.
 
 ### April 19, 2026 — Initial polling and rate-limit work
 
@@ -282,7 +346,7 @@ Reorganized the README around features, compatibility, HACS installation, config
 [Commit 678728d](https://github.com/pinskig/hass-haven-lighting-part3/commit/678728d03194e4bda64752856cf324ba26b61743)
 
 - Made color-, temperature-, and effect-only turn-on actions explicitly request power on despite stale cached state.
-- Preserved reported brightness during Fire, Sunset, and Ocean effects.
+- Preserved reported brightness during Fire, Sunset, and Ocean selections, which that release still labeled as effects.
 - Added sanitized DEBUG records for actual HTTP attempts, including status and elapsed time, while distinguishing locally blocked calls.
 - Added regressions for state divergence, effect brightness, request accounting, timing, and sensitive-data exclusion. Validation reached **91 unit tests and 29 framework tests on each Home Assistant version**.
 
@@ -342,19 +406,29 @@ The upstream `InformationSummaryWithAllZonesGroup` endpoint is a promising way t
 - Kept selector commands on the light service path to preserve current HA's handling of an in-flight white selection followed by toggle. Added regressions for exact payloads, brightness preservation, failure handling, empty acknowledgments, external changes, discovery, linked entity behavior, and white-selection ordering.
 - The November 1 log demonstrates both a command backlog and near-white RGB approximation. It also shows cloud inventory acknowledging Fire/white IDs while the maintainer reported different physical output. This release fixes the confirmed selection issues and supplies an exact white control; physical device behavior remains part of the manual check.
 
+### November 1, 2026 — Version 1.0.15
+
+- Corrected **Fire, Sunset, and Ocean** to static colors using the maintainer's recovered Haven/Homey lookup. Added the separate native pattern names **All Colors (35), Warm Colors (33), and Cool Colors (34)** for inventory reporting. No pattern/rate write API is claimed or enabled.
+- Added **Color preset** alongside **White temperature**, using the 20 recovered color names and exact IDs. Both selectors share target/device identity, inventory, request pacing, and the serialized light service. Existing white entity IDs and light automations remain valid.
+- Hid the misleading effects dropdown while retaining the old named `effect:` inputs for automation compatibility. Kept their old reset behavior in the explicit `reset_legacy_color` path. A locally unsupported native-pattern reset now rejects the entire batch before any brightness or other command is sent.
+- Added verified Fire/Sunset RGB swatches in both mapping directions, corrected static mode reporting, and preserved brightness. Actual HA scene tests capture and restore their exact IDs. Ocean remains selectable by name without an invented swatch; documented and tested an explicit Ocean selector/power scene for its capture limitation.
+- Updated redacted diagnostics to identify static `color_preset` values separately from native `effect` names, with allowlisted fields and unchanged credential/token exclusions.
+- Retained exact white selection, empty successful acknowledgments, command failure handling, polling reconciliation, and queued relative-service behavior. Regression coverage includes exact payloads, legacy aliases, shared device identity, external changes, failures, native pattern rejection, and scene reproduction on both supported test versions.
+- Updated this README with the corrected classification, recovered lookup, compatibility details, known limitations, and manual test sequence.
+
 ## Development tests
 
-Version **1.0.14** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
+Version **1.0.15** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
 
 | Suite | Environment | Result |
 | --- | --- | --- |
-| Client and adapter regressions | Python 3.12 | 125 passed |
-| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 99 passed, 3 skipped |
-| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 102 passed |
+| Client and adapter regressions | Python 3.12 | 135 passed |
+| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 120 passed, 3 skipped |
+| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 123 passed |
 
 These are controlled offline checks. They exercise actual Home Assistant behavior against fake Haven responses; they do not certify live-provider quotas or physical-light behavior. The declared Home Assistant minimum is 2024.1.0; the framework matrix tests the two exact releases above.
 
-The three minimum-version skips cover concurrent single-entity toggle and relative-brightness ordering, including a white selection followed by toggle: HA 2024.1 bypasses its platform semaphore on that path, a pre-existing framework limitation this release does not fix. All three ordering tests run and pass on HA 2026.10.4. All preset, effect-off, empty-response, action-diagnostic, and external-reconciliation tests run on both versions. The tests verify final backend state and absence of poll-generated command loops; they do not observe the browser control marker or a physical Haven device.
+The three minimum-version skips cover concurrent single-entity toggle and relative-brightness ordering, including a white selection followed by toggle: HA 2024.1 bypasses its platform semaphore on that path, a pre-existing framework limitation this release does not fix. All three ordering tests run and pass on HA 2026.10.4. All preset, legacy-reset, scene, empty-response, action-diagnostic, and external-reconciliation tests run on both versions. The tests verify final backend state and absence of poll-generated command loops; they do not observe the browser control marker or a physical Haven device.
 
 ### Unit and contract tests
 

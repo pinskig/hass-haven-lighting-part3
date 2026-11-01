@@ -1,3 +1,3 @@
 """Release of the bundled integration code imported into this process."""
 
-INTEGRATION_VERSION = "1.0.14"
+INTEGRATION_VERSION = "1.0.15"

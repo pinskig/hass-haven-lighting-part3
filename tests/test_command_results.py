@@ -160,7 +160,7 @@ class CommandResultTests(unittest.TestCase):
                     self.assertEqual(light.brightness, 128)
                     self.assertFalse(light.is_on)
 
-    def test_white_uses_warm_preset_for_rgb_effect_or_unknown_state(self):
+    def test_white_uses_warm_preset_for_color_or_unknown_state(self):
         for color_id in (None, 0, 11, 12, 25, 28, 999):
             with self.subTest(color_id=color_id):
                 light = Light.from_state(self.credentials, LightState(

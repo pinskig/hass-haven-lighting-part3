@@ -1,8 +1,12 @@
-"""Exact white temperature presets for existing Haven lights."""
+"""Exact white temperature and named color presets for existing Haven lights."""
 
 from __future__ import annotations
 
-from homeassistant.components.light import ATTR_COLOR_TEMP_KELVIN, DOMAIN as LIGHT_DOMAIN
+from homeassistant.components.light import (
+    ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
+    DOMAIN as LIGHT_DOMAIN,
+)
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_ON, STATE_UNAVAILABLE
@@ -15,7 +19,12 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import HavenCoordinator
-from .havenlighting.colors import HAVEN_KELVIN_MAP, KELVIN_BY_ID
+from .havenlighting.colors import (
+    COLOR_BY_ID,
+    HAVEN_COLOR_MAP,
+    HAVEN_KELVIN_MAP,
+    KELVIN_BY_ID,
+)
 from .havenlighting.models import TargetKey
 from .registry import async_prepare_registries, entity_unique_id
 
@@ -31,7 +40,7 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Add a companion selector when each zone or group is discovered."""
+    """Add both companion selectors when each zone or group is discovered."""
     coordinators: list[HavenCoordinator] = hass.data[DOMAIN][config_entry.entry_id]["coordinators"]
     warned: set[str] = set()
 
@@ -47,7 +56,11 @@ async def async_setup_entry(
                 return
             async_prepare_registries(hass, config_entry, coordinators, warned)
             keys = sorted(added, key=lambda key: (key.kind, key.remote_id))
-            entities = [HavenWhiteTemperatureSelect(key, coordinator) for key in keys]
+            entities = [
+                entity_class(key, coordinator)
+                for key in keys
+                for entity_class in (HavenWhiteTemperatureSelect, HavenColorPresetSelect)
+            ]
             known.update(keys)
             async_add_entities(entities)
 
@@ -58,19 +71,18 @@ async def async_setup_entry(
         watch_inventory(coordinator)
 
 
-class HavenWhiteTemperatureSelect(CoordinatorEntity[HavenCoordinator], SelectEntity):
-    """Select a known white preset using the associated light's service path."""
+class _HavenPresetSelect(CoordinatorEntity[HavenCoordinator], SelectEntity):
+    """Share target identity and the associated light's serialized service path."""
 
     _attr_has_entity_name = True
-    _attr_translation_key = "white_temperature"
-    _attr_options = list(WHITE_TEMPERATURE_OPTIONS)
+    _unique_id_suffix: str
 
     def __init__(self, key: TargetKey, coordinator: HavenCoordinator) -> None:
         super().__init__(coordinator)
         self._key = key
         self._last_name = coordinator.data[key].name
         self._light_unique_id = entity_unique_id(coordinator.account_id, key)
-        self._attr_unique_id = f"{self._light_unique_id}:white_temperature"
+        self._attr_unique_id = f"{self._light_unique_id}:{self._unique_id_suffix}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._light_unique_id)},
             name=self._last_name,
@@ -81,12 +93,6 @@ class HavenWhiteTemperatureSelect(CoordinatorEntity[HavenCoordinator], SelectEnt
     @property
     def available(self) -> bool:
         return super().available and self._key in (self.coordinator.data or {})
-
-    @property
-    def current_option(self) -> str | None:
-        state = (self.coordinator.data or {}).get(self._key)
-        kelvin = KELVIN_BY_ID.get(state.color_id) if state is not None else None
-        return f"{kelvin} K" if kelvin is not None else None
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -100,10 +106,8 @@ class HavenWhiteTemperatureSelect(CoordinatorEntity[HavenCoordinator], SelectEnt
                 self._last_name = updated.name
         super()._handle_coordinator_update()
 
-    async def async_select_option(self, option: str) -> None:
-        """Select the white preset and turn on through the existing light entity."""
-        if option not in WHITE_TEMPERATURE_OPTIONS:
-            raise HomeAssistantError("Unknown Haven white temperature preset")
+    async def _async_turn_on(self, parameters: dict[str, int | str]) -> None:
+        """Dispatch a preset through the enabled light without approximating it."""
         registry = er.async_get(self.hass)
         entity_id = registry.async_get_entity_id(LIGHT_DOMAIN, DOMAIN, self._light_unique_id)
         linked = registry.async_get(entity_id) if entity_id is not None else None
@@ -111,7 +115,7 @@ class HavenWhiteTemperatureSelect(CoordinatorEntity[HavenCoordinator], SelectEnt
             raise HomeAssistantError("The corresponding Haven light entity is missing")
         if linked.disabled_by is not None:
             raise HomeAssistantError(
-                "Enable the corresponding Haven light entity to select a white temperature"
+                "Enable the corresponding Haven light entity to select a Haven preset"
             )
         state = self.hass.states.get(entity_id)
         if state is None or state.state == STATE_UNAVAILABLE:
@@ -122,10 +126,48 @@ class HavenWhiteTemperatureSelect(CoordinatorEntity[HavenCoordinator], SelectEnt
         await self.hass.services.async_call(
             LIGHT_DOMAIN,
             SERVICE_TURN_ON,
-            {
-                ATTR_ENTITY_ID: entity_id,
-                ATTR_COLOR_TEMP_KELVIN: WHITE_TEMPERATURE_OPTIONS[option],
-            },
+            {ATTR_ENTITY_ID: entity_id, **parameters},
             blocking=True,
             context=getattr(self, "_context", None),
         )
+
+
+class HavenWhiteTemperatureSelect(_HavenPresetSelect):
+    """Select a known white preset using the associated light's service path."""
+
+    _attr_translation_key = "white_temperature"
+    _attr_options = list(WHITE_TEMPERATURE_OPTIONS)
+    _unique_id_suffix = "white_temperature"
+
+    @property
+    def current_option(self) -> str | None:
+        state = (self.coordinator.data or {}).get(self._key)
+        kelvin = KELVIN_BY_ID.get(state.color_id) if state is not None else None
+        return f"{kelvin} K" if kelvin is not None else None
+
+    async def async_select_option(self, option: str) -> None:
+        """Select the white preset and turn on through the existing light entity."""
+        if option not in WHITE_TEMPERATURE_OPTIONS:
+            raise HomeAssistantError("Unknown Haven white temperature preset")
+        await self._async_turn_on({ATTR_COLOR_TEMP_KELVIN: WHITE_TEMPERATURE_OPTIONS[option]})
+
+
+class HavenColorPresetSelect(_HavenPresetSelect):
+    """Select an exact named color instead of approximating its RGB swatch."""
+
+    _attr_translation_key = "color_preset"
+    _attr_options = list(HAVEN_COLOR_MAP)
+    _unique_id_suffix = "color_preset"
+
+    @property
+    def current_option(self) -> str | None:
+        state = (self.coordinator.data or {}).get(self._key)
+        return COLOR_BY_ID.get(state.color_id) if state is not None else None
+
+    async def async_select_option(self, option: str) -> None:
+        """Select a color ID through the light's existing named-color aliases."""
+        if option not in HAVEN_COLOR_MAP:
+            raise HomeAssistantError("Unknown Haven color preset")
+        # The light accepts these names as compatibility inputs, but reports
+        # static color state and does not advertise them in an effect menu.
+        await self._async_turn_on({ATTR_EFFECT: option})

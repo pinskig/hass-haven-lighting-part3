@@ -23,8 +23,8 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .havenlighting.colors import (
-    EFFECT_BY_ID, HAVEN_EFFECT_MAP, HAVEN_KELVIN_MAP, HAVEN_RGB_MAP,
-    KELVIN_BY_ID, RGB_BY_ID,
+    COLOR_BY_ID, HAVEN_COLOR_MAP, HAVEN_KELVIN_MAP, HAVEN_PATTERN_MAP,
+    HAVEN_RGB_MAP, KELVIN_BY_ID, PATTERN_BY_ID, RGB_BY_ID,
 )
 from .const import DOMAIN
 from .coordinator import HavenCoordinator
@@ -91,8 +91,11 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
 
     _attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP}
 
+    # HA filters effect inputs before dispatch without this feature bit. Keep
+    # legacy named-color actions working, but hide the incorrect effect menu.
+    # Native pattern selection/rate commands have not yet been verified.
     _attr_supported_features = LightEntityFeature.EFFECT
-    _attr_effect_list = [*HAVEN_EFFECT_MAP, EFFECT_OFF]
+    _attr_effect_list = None
     _attr_min_color_temp_kelvin = 2700
     _attr_max_color_temp_kelvin = 5000
 
@@ -145,9 +148,9 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
     def color_mode(self) -> ColorMode:
         if self._state.color_id in KELVIN_BY_ID:
             return ColorMode.COLOR_TEMP
-        if self._state.color_id in RGB_BY_ID:
+        if self._state.color_id in COLOR_BY_ID:
             return ColorMode.RGB
-        if self._state.color_id in EFFECT_BY_ID:
+        if self._state.color_id in PATTERN_BY_ID:
             return ColorMode.BRIGHTNESS
         return ColorMode.UNKNOWN
 
@@ -161,12 +164,7 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
 
     @property
     def effect(self) -> str | None:
-        color_id = self._state.color_id
-        if color_id in EFFECT_BY_ID:
-            return EFFECT_BY_ID[color_id]
-        if color_id in KELVIN_BY_ID or color_id in RGB_BY_ID:
-            return EFFECT_OFF
-        return None
+        return PATTERN_BY_ID.get(self._state.color_id)
 
     async def async_request_call(self, coro: Coroutine[Any, Any, Any]) -> Any:
         """Trace HA's service wait without changing its semaphore or inputs.
@@ -204,9 +202,15 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
         color_id = None
         effect = kwargs.get(ATTR_EFFECT)
         if effect is not None and effect != EFFECT_OFF:
-            if effect not in HAVEN_EFFECT_MAP:
-                raise HomeAssistantError(f"Unknown Haven effect: {effect}")
-            color_id = HAVEN_EFFECT_MAP[effect]
+            if effect in HAVEN_PATTERN_MAP:
+                raise HomeAssistantError(
+                    "Native Haven pattern controls are not supported yet; use the Haven app"
+                )
+            if effect not in HAVEN_COLOR_MAP:
+                raise HomeAssistantError(f"Unknown Haven color preset: {effect}")
+            # Compatibility for old effect: Fire/Sunset/Ocean actions, and
+            # exact routing for the named Color preset selector.
+            color_id = HAVEN_COLOR_MAP[effect]
         elif ATTR_COLOR_TEMP_KELVIN in kwargs:
             kelvin = kwargs[ATTR_COLOR_TEMP_KELVIN]
             color_id = min(HAVEN_KELVIN_MAP, key=lambda value: abs(value - kelvin))
@@ -215,14 +219,14 @@ class HavenLight(CoordinatorEntity[HavenCoordinator], LightEntity):
             if tuple(kwargs[ATTR_RGB_COLOR]) == (255, 255, 255):
                 # RGB white has no Kelvin value. Resolve a real white preset
                 # under the operation lock: retain the current white setting,
-                # or use warm white when coming from a color or effect.
+                # or use warm white when coming from another preset.
                 commands.append(("set_white", ()))
             else:
                 color_id = self._find_closest_color_id(*kwargs[ATTR_RGB_COLOR])
         elif effect == EFFECT_OFF:
-            # Decide against execution-time state: an earlier queued action
-            # may start an effect or select a static color before this runs.
-            commands.append(("stop_effect", ()))
+            # Preserve the old alias reset at execution time; this is not a
+            # command that stops a native Haven pattern.
+            commands.append(("reset_legacy_color", ()))
 
         if color_id is not None:
             commands.append(("set_color", (color_id,)))

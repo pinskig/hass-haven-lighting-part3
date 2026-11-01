@@ -33,6 +33,9 @@
     "select": {
       "white_temperature": {
         "name": "White temperature"
+      },
+      "color_preset": {
+        "name": "Color preset"
       }
     }
   }

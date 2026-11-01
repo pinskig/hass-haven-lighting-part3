@@ -11,6 +11,7 @@ import pytest
 import requests
 from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.setup import async_setup_component
 
 from conftest import async_drain_scheduled_work
 from test_entities import entity_for
@@ -162,7 +163,7 @@ async def test_color_requests_execute_in_order_and_settle_on_final_intent(
     assert _commands(haven_api) == expected
 
 
-@pytest.mark.parametrize("barrier", ["off", "brightness", "effect", "other-target"])
+@pytest.mark.parametrize("barrier", ["off", "brightness", "named-color", "other-target"])
 async def test_mixed_light_requests_preserve_order(
     hass, real_loaded_entry, haven_api, queued_services, barrier
 ):
@@ -173,7 +174,7 @@ async def test_mixed_light_requests_preserve_order(
     elif barrier == "brightness":
         middle = ("turn_on", {"entity_id": entity_id, "brightness": 204})
         middle_commands = [("/Commands/Brightness", ("Zone", 101), 8)]
-    elif barrier == "effect":
+    elif barrier == "named-color":
         middle = ("turn_on", {"entity_id": entity_id, "effect": "Fire"})
         middle_commands = _color_commands(12)
     else:
@@ -284,7 +285,7 @@ async def test_brightness_steps_resolve_after_preceding_commands(
     assert state.attributes["color_temp_kelvin"] == 3500
 
 
-async def test_queued_effect_off_stops_the_in_flight_effect(
+async def test_queued_legacy_effect_off_resets_the_in_flight_named_color(
     hass, real_loaded_entry, haven_api, queued_services
 ):
     entity_id = entity_for(hass)
@@ -295,16 +296,16 @@ async def test_queued_effect_off_stops_the_in_flight_effect(
     assert outcomes == [None, None]
     assert _commands(haven_api) == _color_commands(12) + _color_commands(1)
     state = hass.states.get(entity_id)
-    assert state.attributes["effect"] == "off"
+    assert state.attributes["effect"] is None
     assert state.attributes["color_mode"] == "color_temp"
     assert state.attributes["color_temp_kelvin"] == 2700
 
 
-async def test_queued_effect_off_preserves_the_preceding_static_color(
+async def test_queued_legacy_effect_off_preserves_a_color_outside_the_old_alias_set(
     hass, real_loaded_entry, haven_api, queued_services
 ):
-    # At receipt time the cached state is an effect. The commands ahead of
-    # effect-off will replace it with static colors before effect-off executes.
+    # Fire was historically exposed through the effect argument. Resolve the
+    # compatibility reset after preceding commands select other static colors.
     haven_api.zones[0].update(isOn=True, colorId=12)
     coordinator = hass.data["haven"][real_loaded_entry.entry.entry_id]["coordinators"][0]
     await coordinator.async_refresh()
@@ -320,7 +321,7 @@ async def test_queued_effect_off_preserves_the_preceding_static_color(
         _color_commands(3) + _color_commands(25) + [("/Commands/On", ("Zone", 101), None)]
     )
     state = hass.states.get(entity_id)
-    assert state.attributes["effect"] == "off"
+    assert state.attributes["effect"] is None
     assert state.attributes["color_mode"] == "rgb"
     assert state.attributes["rgb_color"] == (0, 0, 255)
 
@@ -394,7 +395,7 @@ async def test_rgb_white_sends_a_white_preset_and_preserves_brightness(
     assert state.attributes["color_temp_kelvin"] == kelvin
     # HA synthesizes display RGB from Kelvin even though the provider receives
     # only colorId. The active mode and captured payload establish white intent.
-    assert state.attributes["effect"] == "off"
+    assert state.attributes["effect"] is None
     assert state.attributes["brightness"] == brightness
 
     await coordinator.async_refresh()
@@ -434,3 +435,49 @@ async def test_nonwhite_rgb_still_uses_the_existing_color_presets(
     )
     assert _commands(haven_api) == _color_commands(expected_id)
     assert hass.states.get(entity_id).attributes["color_mode"] == "rgb"
+
+
+@pytest.mark.parametrize(("name", "color_id"), [("Fire", 12), ("Sunset", 17)])
+async def test_static_color_scene_roundtrip_preserves_the_exact_preset(
+    hass, real_loaded_entry, haven_api, name, color_id,
+):
+    """Scene restore must map the newly reported RGB back to its exact ID."""
+    assert await async_setup_component(hass, "scene", {"scene": []})
+    await async_drain_scheduled_work(hass)
+    entity_id = entity_for(hass)
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id, "effect": name}, blocking=True,
+    )
+    assert hass.states.get(entity_id).attributes["effect"] is None
+    await hass.services.async_call(
+        "scene", "create",
+        {"scene_id": "haven_static_color", "snapshot_entities": [entity_id]},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        "light", "turn_on",
+        {"entity_id": entity_id, "color_temp_kelvin": 5000}, blocking=True,
+    )
+    commands_before = len(haven_api.command_calls)
+    await hass.services.async_call(
+        "scene", "turn_on", {"entity_id": "scene.haven_static_color"}, blocking=True,
+    )
+    await async_drain_scheduled_work(hass)
+    restored = haven_api.command_calls[commands_before:]
+    assert [kwargs["json"]["colorId"] for _method, path, kwargs in restored
+            if path == "/Commands/SetColor"] == [color_id]
+    assert haven_api.zones[0]["colorId"] == color_id
+    assert hass.states.get(entity_id).attributes["color_mode"] == "rgb"
+    assert hass.states.get(entity_id).attributes["effect"] is None
+
+
+@pytest.mark.parametrize("pattern", ["All Colors", "Warm Colors", "Cool Colors"])
+async def test_native_pattern_commands_are_rejected_without_writes(
+    hass, real_loaded_entry, haven_api, pattern,
+):
+    with pytest.raises(HomeAssistantError, match="Native Haven pattern controls"):
+        await hass.services.async_call(
+            "light", "turn_on", {"entity_id": entity_for(hass), "effect": pattern},
+            blocking=True,
+        )
+    assert haven_api.command_calls == []

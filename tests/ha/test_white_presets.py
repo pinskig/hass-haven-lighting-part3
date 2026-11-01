@@ -92,7 +92,7 @@ async def test_2700_preset_replaces_active_red_or_fire(
     assert state.state == "on"
     assert state.attributes["color_mode"] == "color_temp"
     assert state.attributes["color_temp_kelvin"] == 2700
-    assert state.attributes["effect"] == "off"
+    assert state.attributes["effect"] is None
     assert hass.states.get(select_for(hass)).state == "2700 K"
 
 
