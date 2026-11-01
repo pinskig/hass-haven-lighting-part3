@@ -483,3 +483,72 @@ async def test_malformed_command_reply_stops_batch_without_confirmation_or_repla
     assert [call[1] for call in haven_api.command_calls] == ["/Commands/SetColor"]
     assert coordinator.data[key].color_id == 25
     assert coordinator.data[key].is_on is False
+
+
+async def test_unchanged_command_failure_keeps_pending_refresh(
+    hass, real_loaded_entry, haven_api, budget_transport
+):
+    """A failed reply must not cancel a previously scheduled reconciliation."""
+    from custom_components.haven.const import COMMAND_REFRESH_DELAY
+
+    coordinator = hass.data["haven"][real_loaded_entry.entry.entry_id]["coordinators"][0]
+    entity_id = entity_for(hass)
+    before = len(budget_transport.calls)
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id}, blocking=True
+    )
+    previous = coordinator.data
+    budget_transport.command_response_body = b'{"truncated":'
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            "light", "turn_on", {"entity_id": entity_id, "rgb_color": (0, 0, 255)},
+            blocking=True,
+        )
+    await async_drain_scheduled_work(hass)
+    assert coordinator.data == previous
+    assert haven_api.zones[0]["colorId"] == 25
+    assert len(budget_transport.calls) == before + 2
+
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=COMMAND_REFRESH_DELAY + 1)
+    )
+    await async_drain_scheduled_work(hass)
+    assert [(method, path) for _session, method, path in budget_transport.calls[before:]] == [
+        ("POST", "/Commands/On"), ("POST", "/Commands/SetColor"),
+        ("GET", f"/LightAndZones/OrderedList/{LOCATION_ID}"),
+        ("GET", f"/Group/AllGroupsByLocation/{LOCATION_ID}"),
+    ]
+    assert hass.states.get(entity_id).state == "on"
+    assert hass.states.get(entity_id).attributes["rgb_color"] == (0, 0, 255)
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_unchanged_command_failure_does_not_bypass_cooldown(
+    hass, real_loaded_entry, budget_transport, status
+):
+    """Keeping a pending read never sends HTTP through a provider cooldown."""
+    from custom_components.haven.const import COMMAND_REFRESH_DELAY
+
+    context = real_loaded_entry
+    entity_id = entity_for(hass)
+    before = len(budget_transport.calls)
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id}, blocking=True
+    )
+    budget_transport.command_status = status
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            "light", "turn_on", {"entity_id": entity_id, "rgb_color": (0, 0, 255)},
+            blocking=True,
+        )
+    retry_at = context.gate.snapshot()["retry_at"]
+    assert context.gate.rate_limit_remaining == 3600
+
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=COMMAND_REFRESH_DELAY + 1)
+    )
+    await async_drain_scheduled_work(hass)
+    assert [(method, path) for _session, method, path in budget_transport.calls[before:]] == [
+        ("POST", "/Commands/On"), ("POST", "/Commands/SetColor"),
+    ]
+    assert context.gate.snapshot()["retry_at"] == retry_at

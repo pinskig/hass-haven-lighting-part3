@@ -5,11 +5,12 @@ from datetime import timedelta
 from unittest.mock import Mock
 
 import pytest
+from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import async_fire_time_changed
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
 from conftest import ACCOUNT_ID, LOCATION_ID, async_drain_scheduled_work
 
@@ -21,7 +22,7 @@ def entity_for(hass, *, kind="zone", remote_id=101):
     return result
 
 
-async def test_real_setup_preserves_six_digit_controller(hass, loaded_entry):
+async def test_real_setup_preserves_six_digit_controller(hass, caplog, loaded_entry):
     registry = dr.async_get(hass)
     controller = next(
         (device for device in dr.async_entries_for_config_entry(registry, loaded_entry.entry_id)
@@ -33,6 +34,54 @@ async def test_real_setup_preserves_six_digit_controller(hass, loaded_entry):
     child = registry.async_get(entity.device_id)
     assert child.via_device_id == controller.id
     assert hass.states.get(entity.entity_id).state == "off"
+    assert not any(
+        "uses `device_registry.devices` as a mapping" in record.getMessage()
+        for record in caplog.get_records("setup")
+    )
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        f"haven:{ACCOUNT_ID}:location:{LOCATION_ID}",
+        f"haven:{ACCOUNT_ID}:{LOCATION_ID}:zone:101",
+    ],
+    ids=["controller", "zone"],
+)
+async def test_setup_preserves_devices_owned_by_another_entry(
+    hass, entry, client_factory, identifier
+):
+    other_entry = MockConfigEntry(
+        domain="haven",
+        title="Other Haven entry",
+        unique_id="other@example.invalid",
+        data={"email": "other@example.invalid", "password": "other-password"},
+        disabled_by=ConfigEntryDisabler.USER,
+    )
+    other_entry.add_to_hass(hass)
+    registry = dr.async_get(hass)
+    area = ar.async_get(hass).async_create("Existing garden")
+    original = registry.async_get_or_create(
+        config_entry_id=other_entry.entry_id,
+        identifiers={("haven", identifier)},
+        name="Existing device",
+        manufacturer="Haven",
+    )
+    registry.async_update_device(
+        original.id, name_by_user="Keep my device name", area_id=area.id
+    )
+
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert dr.async_entries_for_config_entry(registry, entry.entry_id) == []
+    assert [
+        device.id for device in dr.async_entries_for_config_entry(registry, other_entry.entry_id)
+    ] == [original.id]
+    preserved = registry.async_get(original.id)
+    assert preserved.identifiers == {("haven", identifier)}
+    assert preserved.name_by_user == "Keep my device name"
+    assert preserved.area_id == area.id
 
 
 async def test_same_number_zone_and_group_get_distinct_entities(

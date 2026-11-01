@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -63,7 +64,11 @@ def async_prepare_registries(
     }
     # Older HA registries match identifiers globally. Do not let get_or_create
     # attach this entry to, or change, another entry's namespaced device.
-    for device in devices.devices.values():
+    all_devices = devices.devices
+    # Older HA exposes a mapping; current HA iterates device entries directly.
+    if isinstance(all_devices, Mapping):
+        all_devices = all_devices.values()
+    for device in all_devices:
         if device.identifiers & wanted_identifiers and not _exclusively_owned(device, entry.entry_id):
             raise ConfigEntryError(
                 "Another entry already owns these Haven devices; resolve the duplicate account entry"

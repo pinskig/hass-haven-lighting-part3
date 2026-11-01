@@ -108,7 +108,9 @@ class HavenCoordinator(DataUpdateCoordinator[dict[TargetKey, LightState]]):
                 # while surfacing the failure; no automatic command retry.
                 data = self.location.snapshot
                 self._last_refresh_data = data
-                if self.last_update_success:
+                # Publishing unchanged data would cancel a pending refresh and
+                # postpone the normal poll without a confirmed state change.
+                if self.last_update_success and data != self.data:
                     self.async_set_updated_data(data)
                 accounts = await async_get_account_store(self.hass)
                 await accounts.async_flush()
