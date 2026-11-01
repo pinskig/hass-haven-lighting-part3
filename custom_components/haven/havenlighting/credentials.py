@@ -150,9 +150,21 @@ class Credentials:
                 "Password": password,
                 "DeviceId": self._session_device_id,
             }
-            response = self._make_request_internal(
-                "POST", "/Auth/Authenticate", json=payload, auth_required=False
-            )
+            try:
+                response = self._make_request_internal(
+                    "POST", "/Auth/Authenticate", json=payload, auth_required=False
+                )
+            except ApiError as error:
+                # A rejected sign-in needs attention, not repeated setup calls
+                # with the same input. This status does not prove a bad password.
+                # Keep transient errors and other endpoints' 400s unchanged.
+                if error.code == 400:
+                    raise AuthenticationError(
+                        "Haven rejected the sign-in request (HTTP 400). "
+                        "Check the account in the Haven app, then reauthenticate.",
+                        code=400,
+                    ) from error
+                raise
             self._update_credentials(response, preserve_refresh_token=False)
             logger.debug("Haven authentication succeeded")
             return True

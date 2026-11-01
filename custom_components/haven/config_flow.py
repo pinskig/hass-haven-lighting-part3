@@ -38,8 +38,8 @@ class HavenConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 client.authenticate, data[CONF_EMAIL], data[CONF_PASSWORD]
             )
             return {} if authenticated else {"base": "invalid_auth"}
-        except AuthenticationError:
-            return {"base": "invalid_auth"}
+        except AuthenticationError as error:
+            return {"base": "login_rejected" if error.code == 400 else "invalid_auth"}
         except ApiError as error:
             _LOGGER.warning("Haven setup request failed: %s", error)
             return {"base": "cannot_connect"}

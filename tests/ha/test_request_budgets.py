@@ -8,6 +8,7 @@ files so restoration is checked against serialized data, not a mocked load.
 
 from __future__ import annotations
 
+from datetime import timedelta
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,8 +19,10 @@ import pytest
 import requests
 from homeassistant import config_entries
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
-from conftest import ACCOUNT_ID, LOCATION_ID
+from conftest import ACCOUNT_ID, LOCATION_ID, async_drain_scheduled_work
 from test_entities import entity_for
 
 
@@ -62,7 +65,10 @@ def gate_clock(monkeypatch, custom_integration_and_no_http):
 @pytest.fixture
 def budget_transport(monkeypatch, haven_api, custom_integration_and_no_http):
     """Return real Response objects and observe actual session/pool closure."""
-    transport = SimpleNamespace(calls=[], command_status=None, closed_sessions=[], closed_adapters=[])
+    transport = SimpleNamespace(
+        calls=[], login_calls=[], login_status=200, login_retry_after=None,
+        command_status=None, closed_sessions=[], closed_adapters=[],
+    )
 
     def response(status, data, url, *, retry_after=None):
         result = requests.Response()
@@ -79,6 +85,12 @@ def budget_transport(monkeypatch, haven_api, custom_integration_and_no_http):
         path = urlsplit(url).path.removeprefix("/api")
         transport.calls.append((session, method, path))
         if path == "/Auth/Authenticate":
+            transport.login_calls.append((session, dict(kwargs.get("json", {}))))
+            if transport.login_status != 200:
+                return response(
+                    transport.login_status, {"message": "Synthetic sign-in rejection"},
+                    url, retry_after=transport.login_retry_after,
+                )
             return response(200, {
                 "token": "test-access-token", "refreshToken": "test-refresh-token", "id": int(ACCOUNT_ID)
             }, url)
@@ -272,3 +284,113 @@ async def test_separate_reauth_flow_shares_budget_and_closes_its_real_pool(
     assert set(session.adapters.values()) <= set(budget_transport.closed_adapters)
     assert not context.client.closed
     assert context.entry.data["password"] == "test-password"
+
+
+async def test_login_400_stops_setup_retries_and_recovers_through_reauth(
+    hass, entry, gate_clock, budget_transport, real_clients
+):
+    from custom_components.haven.runtime import async_get_account_store
+
+    accounts = await async_get_account_store(hass)
+    gate = await accounts.async_get_gate(entry.data["email"])
+    gate.min_request_interval = 0
+    budget_transport.login_status = 400
+
+    try:
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await async_drain_scheduled_work(hass)
+        assert entry.state is config_entries.ConfigEntryState.SETUP_ERROR
+        failed_client = hass.data["haven"][entry.entry_id]["client"]
+        assert hass.data["haven"][entry.entry_id]["authentication_required"]
+        assert len(budget_transport.calls) == 1
+        assert len(budget_transport.login_calls) == 1
+        assert gate.rate_limit_remaining == 0
+
+        # A rejected sign-in needs user action, not another unchanged login.
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=11))
+        await async_drain_scheduled_work(hass)
+        assert len(budget_transport.calls) == 1
+        reauth_flows = [
+            flow for flow in hass.config_entries.flow.async_progress()
+            if flow["context"].get("entry_id") == entry.entry_id
+            and flow["context"].get("source") == config_entries.SOURCE_REAUTH
+        ]
+        assert len(reauth_flows) == 1
+        flow_id = reauth_flows[0]["flow_id"]
+
+        result = await hass.config_entries.flow.async_configure(
+            flow_id, user_input={"password": "still-rejected-password"}
+        )
+        assert result["type"] == "form"
+        assert result["step_id"] == "reauth_confirm"
+        assert result["errors"] == {"base": "login_rejected"}
+        assert entry.data["password"] == "test-password"
+        assert len(budget_transport.login_calls) == 2
+        assert real_clients.clients[-1].closed
+        assert not failed_client.closed
+
+        budget_transport.login_status = 200
+        result = await hass.config_entries.flow.async_configure(
+            flow_id, user_input={"password": "replacement-password"}
+        )
+        await async_drain_scheduled_work(hass)
+        assert result["type"] == "abort"
+        assert result["reason"] == "reauth_successful"
+        assert entry.state is config_entries.ConfigEntryState.LOADED
+        assert entry.data["password"] == "replacement-password"
+        assert len(hass.config_entries.async_entries("haven")) == 1
+
+        # HA does not run the integration unload hook for failed initial setup.
+        # Its retained client must authenticate with the newly stored password.
+        runtime = hass.data["haven"][entry.entry_id]
+        assert runtime["client"] is failed_client
+        assert not runtime["authentication_required"]
+        assert failed_client.is_authenticated
+        assert len(real_clients.clients) == 3
+        assert all(client.closed for client in real_clients.clients[1:])
+        assert all(client.request_gate is gate for client in real_clients.clients)
+        assert len(budget_transport.login_calls) == 4
+        assert budget_transport.login_calls[-1][0] is failed_client._credentials._session
+        assert budget_transport.login_calls[-1][1]["Password"] == "replacement-password"
+        assert hass.states.get(entity_for(hass)).state == "off"
+    finally:
+        await hass.config_entries.async_remove(entry.entry_id)
+        await async_drain_scheduled_work(hass)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_error"),
+    [(400, "login_rejected"), (429, "cannot_connect"), (503, "cannot_connect")],
+)
+async def test_setup_form_distinguishes_login_rejection_from_provider_cooldown(
+    hass, gate_clock, budget_transport, real_clients, status, expected_error
+):
+    from custom_components.haven.runtime import async_get_account_store
+
+    email = "new-account@example.invalid"
+    accounts = await async_get_account_store(hass)
+    gate = await accounts.async_get_gate(email)
+    gate.min_request_interval = 0
+    budget_transport.login_status = status
+    budget_transport.login_retry_after = 3600 if status in (429, 503) else None
+    form = await hass.config_entries.flow.async_init(
+        "haven", context={"source": config_entries.SOURCE_USER}
+    )
+
+    for password in ("test-password", "replacement-password"):
+        result = await hass.config_entries.flow.async_configure(
+            form["flow_id"], user_input={"email": email, "password": password}
+        )
+        assert result["type"] == "form"
+        assert result["errors"] == {"base": expected_error}
+        assert real_clients.clients[-1].closed
+        assert real_clients.clients[-1].request_gate is gate
+
+    assert hass.config_entries.async_entries("haven") == []
+    if status == 400:
+        assert len(budget_transport.login_calls) == 2
+        assert gate.rate_limit_remaining == 0
+    else:
+        assert len(budget_transport.login_calls) == 1
+        assert gate.rate_limit_remaining == 3600
+    hass.config_entries.flow.async_abort(form["flow_id"])

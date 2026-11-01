@@ -4,7 +4,7 @@ A Home Assistant integration for Haven Lighting cloud-connected landscape lighti
 
 This project was forked from [Stephen Crescenti's Haven Lighting Redux](https://github.com/screscenti/hass-haven-lighting-redux) on **April 19, 2026**. Redux supplied the 2025 Haven API rewrite and built on [Mickey Schwab's original integration](https://github.com/mickeyschwab/haven-hass). Part 3 builds on that foundation with shared polling, account-wide request protection, safer state and device handling, and automated regression coverage. The [development history](#ai-assisted-development-since-the-fork) records the changes made since the fork.
 
-**Current integration version: 1.0.8** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
+**Current integration version: 1.0.9** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
 
 [Features](#features-and-current-scope) · [Installation](#installation-and-configuration) · [Request handling](#polling-and-request-handling) · [Automations](#automations) · [Troubleshooting](#troubleshooting) · [Change history](#ai-assisted-development-since-the-fork) · [Development tests](#development-tests)
 
@@ -38,7 +38,7 @@ Setup prevents duplicate active entries for the same normalized email address. I
 
 ### Updating an existing installation
 
-Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.8**.
+Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.9**.
 
 The registry migration introduced in 1.0.7 gives targets identifiers that distinguish their account, location, and zone/group type. When a legacy target's identity can be established, migration preserves its entity ID, device ID, custom names, and area assignments. Existing automations retain their references for successfully migrated targets. Migration also handles a legacy target that first reappears after setup.
 
@@ -68,6 +68,7 @@ Authentication, token renewal, discovery, polling, and commands use the same req
 | Request during cooldown | Rejects the call locally without sending HTTP, extending the deadline, or increasing the rate-limit counter. Commands report an error. |
 | Recovery | Three consecutive successful HTTP responses reset the 429 escalation. |
 | HTTP 401 | Allows one serialized token-renewal attempt and one retry; rejected credentials lead to reauthentication. |
+| HTTP 400 from sign-in | Stops automatic setup retries for an existing entry and asks for reauthentication; new setup stays on the sign-in form. A rejected request alone does not identify whether the cause is account details, account status, or an API requirement. Other endpoints' HTTP 400 responses remain ordinary API errors. |
 | Reload or restart | Preserves saved cooldown deadlines and escalation state. Closing a client does not clear the account budget. |
 
 Explicit refreshes and repeated setup attempts respect the same gate. Ordinary transport failures and rate-limit responses do not trigger blind command retries. These safeguards reduce avoidable traffic; they do not establish Haven's service quotas or coordinate requests made by other Home Assistant instances or the Haven app.
@@ -94,6 +95,7 @@ Color-, temperature-, and effect-only turn-on actions explicitly request power o
 | Symptom | What to check |
 | --- | --- |
 | Login or setup fails | Verify the account credentials. A temporary connection error can also mean a provider cooldown is active; repeated setup attempts and restarts respect the saved deadline. |
+| Sign-in is rejected with HTTP 400 | For an existing entry, version 1.0.9 opens a reauthentication prompt instead of retrying automatically. Check that the same account can sign in to the Haven Lighting app, then reauthenticate in Home Assistant. This status alone does not prove the password is wrong. |
 | Entities are missing | Confirm the targets are zones/groups in the account's default location. Allow the next successful refresh for new targets. Check logs for an ambiguous legacy identity or ownership conflict. |
 | Updates are delayed | Normal polling is about once per minute. Commands schedule a debounced refresh, and rate limits can postpone all account traffic. |
 | Entities become unavailable | Check the logs for authentication, connection, payload-validation, or cooldown errors. Failed refreshes retain cached data; targets absent from a successful inventory remain unavailable. |
@@ -126,9 +128,9 @@ For an unresolved problem, [open an issue](https://github.com/pinskig/hass-haven
 
 ## AI-assisted development since the fork
 
-Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.8, including earlier approaches that later releases replaced.
+Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.9, including earlier approaches that later releases replaced.
 
-The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, effect commands, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.8 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
+The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, effect commands, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.9 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
 
 ### April 19, 2026 — Initial polling and rate-limit work
 
@@ -195,15 +197,22 @@ Reorganized the README around features, compatibility, HACS installation, config
 - Added sanitized DEBUG records for actual HTTP attempts, including status and elapsed time, while distinguishing locally blocked calls.
 - Added regressions for state divergence, effect brightness, request accounting, timing, and sensitive-data exclusion. Validation reached **91 unit tests and 29 framework tests on each Home Assistant version**.
 
+### October 31, 2026 — Version 1.0.9
+
+- Stopped automatically retrying a sign-in request rejected with HTTP 400. Existing entries now request reauthentication; setup and reauthentication forms show a specific, neutral sign-in rejection message.
+- Kept rate limits, service outages, and transport failures on their existing retry/cooldown paths. HTTP 400 from commands or discovery is not reclassified as a sign-in failure.
+- Preserved the existing authentication URL, payload, and headers. This change repairs the retry behavior; it does not establish or resolve Haven's underlying reason for a particular rejected login.
+- Added offline transport and real Home Assistant regressions for rejected sign-in, absence of automatic retries, successful recovery of the same entry, and preservation of transient-error handling.
+
 ## Development tests
 
-The [1.0.8 GitHub Actions run](https://github.com/pinskig/hass-haven-lighting-part3/actions/runs/41257424065) passed all three jobs:
+Version **1.0.9** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
 
 | Suite | Environment | Result |
 | --- | --- | --- |
-| Client and adapter regressions | Python 3.12 | 91 passed |
-| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 29 passed |
-| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 29 passed |
+| Client and adapter regressions | Python 3.12 | 96 passed |
+| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 33 passed |
+| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 33 passed |
 
 These are controlled offline checks. They exercise actual Home Assistant behavior against fake Haven responses; they do not certify live-provider quotas or physical-light behavior. The declared Home Assistant minimum is 2024.1.0; the framework matrix tests the two exact releases above.
 

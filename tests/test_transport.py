@@ -23,7 +23,7 @@ from havenlighting.client import HavenClient
 from havenlighting.config import ApiConfig
 from havenlighting import credentials as credentials_module
 from havenlighting.credentials import Credentials
-from havenlighting.exceptions import ApiError
+from havenlighting.exceptions import ApiError, AuthenticationError
 from havenlighting.logging import setup_logging
 from havenlighting import request_gate as request_gate_module
 from havenlighting.request_gate import RequestGate
@@ -90,6 +90,121 @@ class TransportTests(unittest.TestCase):
         )
         self.addCleanup(credentials.close)
         return credentials
+
+    def test_authenticate_wire_contract_matches_inherited_payload(self):
+        device_id = credentials_module.uuid.UUID("12345678-1234-4234-8234-123456789abc")
+        with patch.object(credentials_module.uuid, "uuid4", return_value=device_id):
+            credentials = self.credentials(RequestGate(min_request_interval=0))
+        self.replies.append((200, {
+            "token": "replacement-token", "refreshToken": "replacement-refresh", "id": 123,
+        }, {}))
+
+        self.assertTrue(credentials.authenticate("offline@example.invalid", "DUMMY_PASSWORD"))
+
+        self.assertEqual(len(self.sent), 1)
+        request = self.sent[0][1]
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.url, "https://stg-api.havenlighting.com/api/Auth/Authenticate")
+        self.assertEqual(json.loads(request.body), {
+            "Username": "offline@example.invalid",
+            "Email": "offline@example.invalid",
+            "Password": "DUMMY_PASSWORD",
+            "DeviceId": str(device_id),
+        })
+        self.assertEqual(request.headers["User-Agent"], (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ))
+        self.assertEqual(request.headers["Content-Type"], "application/json")
+        self.assertEqual(request.headers["Accept"], "application/json")
+        self.assertEqual(int(request.headers["Content-Length"]), len(request.body))
+        # The helper seeds an old bearer token; anonymous login must omit it.
+        self.assertNotIn("Authorization", request.headers)
+
+    def test_authenticate_400_requests_reauthentication_without_exposing_secrets(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        self.replies.append((400, {"message": "PRIVATE_PROVIDER_RESPONSE"}, {}))
+        closed = []
+        original_close = requests.Response.close
+
+        def close(response):
+            closed.append(response)
+            return original_close(response)
+
+        with patch.object(requests.Response, "close", new=close), \
+                self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
+            with self.assertRaises(AuthenticationError) as raised:
+                credentials.authenticate("private-email@example.invalid", "PRIVATE_PASSWORD")
+
+        self.assertEqual(raised.exception.code, 400)
+        self.assertIn("Haven rejected the sign-in request (HTTP 400)", str(raised.exception))
+        self.assertIn("reauthenticate", str(raised.exception))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(closed), 1)
+        self.assertIs(closed[0].request, self.sent[0][1])
+        self.assertEqual(credentials._token, "audit-token")
+        self.assertEqual(credentials.request_gate.rate_limit_remaining, 0)
+        diagnostics = "\n".join([
+            str(raised.exception), str(raised.exception.__cause__), *captured.output,
+        ])
+        for secret in ("PRIVATE_PROVIDER_RESPONSE", "PRIVATE_PASSWORD", "private-email@example.invalid", "audit-token"):
+            self.assertNotIn(secret, diagnostics)
+
+    def test_authenticate_classification_does_not_change_other_endpoint_400s(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        operations = (
+            ("poll", lambda: credentials.make_request("GET", "/LightAndZones/OrderedList/123456")),
+            ("command", lambda: credentials.make_request("POST", "/Commands/On", json={"id": 101})),
+            ("token refresh", credentials.refresh_token),
+        )
+        for name, operation in operations:
+            with self.subTest(operation=name):
+                self.replies.append((400, {}, {}))
+                before = len(self.sent)
+                with self.assertRaises(ApiError) as raised:
+                    operation()
+                self.assertEqual(raised.exception.code, 400)
+                self.assertNotIsInstance(raised.exception, AuthenticationError)
+                self.assertEqual(len(self.sent), before + 1)
+
+    def test_authenticate_rate_limits_and_service_failures_remain_retryable(self):
+        for status, retry_after, delay in ((429, "3600", 3600), (503, "3600", 3600), (503, None, 0)):
+            with self.subTest(status=status, retry_after=retry_after):
+                gate = RequestGate(min_request_interval=0)
+                credentials = self.credentials(gate)
+                headers = {} if retry_after is None else {"Retry-After": retry_after}
+                self.replies.append((status, {}, headers))
+                before = len(self.sent)
+                with self.assertRaises(ApiError) as raised:
+                    credentials.authenticate("offline@example.invalid", "DUMMY_PASSWORD")
+                self.assertEqual(raised.exception.code, status)
+                self.assertEqual(raised.exception.retry_after, delay or None)
+                self.assertEqual(gate.rate_limit_remaining, delay)
+                self.assertEqual(gate.snapshot()["consecutive_429"], int(status == 429))
+                self.assertEqual(len(self.sent), before + 1)
+                if delay:
+                    with self.assertRaises(ApiError) as blocked:
+                        credentials.authenticate("offline@example.invalid", "DUMMY_PASSWORD")
+                    self.assertTrue(blocked.exception.rate_limited_locally)
+                    self.assertEqual(gate.rate_limit_remaining, delay)
+                    self.assertEqual(len(self.sent), before + 1)
+
+    def test_authenticate_timeout_remains_retryable(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+
+        def send(adapter, request, **kwargs):
+            self.sent.append((adapter, request, kwargs, self.clock.monotonic()))
+            raise requests.exceptions.Timeout("offline timeout")
+
+        with patch.object(requests.adapters.HTTPAdapter, "send", new=send):
+            with self.assertRaises(ApiError) as raised:
+                credentials.authenticate("offline@example.invalid", "DUMMY_PASSWORD")
+        self.assertIsNone(raised.exception.code)
+        self.assertIsNone(raised.exception.retry_after)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(credentials._token, "audit-token")
+        self.assertEqual(credentials.request_gate.rate_limit_remaining, 0)
 
     def test_redirects_never_forward_login_credentials(self):
         for status in (301, 302, 303, 307, 308):

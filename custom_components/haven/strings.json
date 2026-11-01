@@ -19,6 +19,7 @@
     },
     "error": {
       "invalid_auth": "The Haven email or password was not accepted.",
+      "login_rejected": "Haven rejected the sign-in request (HTTP 400). Check that this account can sign in to the Haven Lighting app, then try again. This response does not identify the reason for the rejection.",
       "cannot_connect": "Haven is temporarily unavailable or limiting requests. Wait before trying again.",
       "unknown": "An unexpected error occurred. Check the Home Assistant logs."
     },
