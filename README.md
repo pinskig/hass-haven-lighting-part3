@@ -4,7 +4,7 @@ A Home Assistant integration for Haven Lighting cloud-connected landscape lighti
 
 This project was forked from [Stephen Crescenti's Haven Lighting Redux](https://github.com/screscenti/hass-haven-lighting-redux) on **April 19, 2026**. Redux supplied the 2025 Haven API rewrite and built on [Mickey Schwab's original integration](https://github.com/mickeyschwab/haven-hass). Part 3 builds on that foundation with shared polling, account-wide request protection, safer state and device handling, and automated regression coverage. The [development history](#ai-assisted-development-since-the-fork) records the changes made since the fork.
 
-**Current integration version: 1.0.11** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
+**Current integration version: 1.0.12** · **Home Assistant: 2024.1.0 or later** · **Installation: HACS custom repository**
 
 [Features](#features-and-current-scope) · [Installation](#installation-and-configuration) · [Request handling](#polling-and-request-handling) · [Automations](#automations) · [Troubleshooting](#troubleshooting) · [Change history](#ai-assisted-development-since-the-fork) · [Development tests](#development-tests)
 
@@ -38,7 +38,7 @@ Setup prevents duplicate active entries for the same normalized email address. I
 
 ### Updating an existing installation
 
-Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.11**.
+Download or redownload the latest repository version in HACS, then restart Home Assistant. The current manifest version is **1.0.12**. A full Home Assistant restart loads the downloaded Python code; reloading the integration alone does not establish that the running code has changed.
 
 The registry migration introduced in 1.0.7 gives targets identifiers that distinguish their account, location, and zone/group type. When a legacy target's identity can be established, migration preserves its entity ID, device ID, custom names, and area assignments. Existing automations retain their references for successfully migrated targets. Migration also handles a legacy target that first reappears after setup.
 
@@ -58,7 +58,7 @@ Light commands accept an empty successful HTTP response as an acknowledgment, in
 
 Both inventory responses are validated before a new snapshot is published. A failed or malformed refresh preserves the previous snapshot and reports an update failure. Command batches cannot interleave with location polling. If a later command fails after an earlier command succeeded, the confirmed changes are retained and the failure is reported; a batch is not rolled back.
 
-If a failed command leaves the cached state unchanged, the existing refresh schedule stays in place. Repeated failures therefore do not keep postponing that state check. These scheduled reads still respect the account's provider cooldown.
+Failed command batches preserve the existing refresh schedule, including when brightness succeeds before color fails. Confirmed changes are published without resetting the polling timer or canceling a pending refresh. Repeated failures therefore do not keep postponing that state check. These scheduled reads still respect the account's provider cooldown.
 
 ### Shared account budget
 
@@ -120,13 +120,15 @@ logger:
     custom_components.haven: debug
 ```
 
-Version 1.0.8 adds records such as:
+Version 1.0.12 extends the HTTP-attempt records introduced in 1.0.8. Example:
 
 ```text
-Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.250s
+Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.250s version=1.0.12 response_bytes=128
 ```
 
-Each record represents an actual HTTP transport attempt and includes its method, fixed endpoint-family label, status or transport-failure marker, and elapsed time. Timing excludes waiting for serialization or pacing. These records omit credentials, tokens, headers, bodies, target IDs, and query values. A locally rejected cooldown call produces no HTTP-attempt record. A transport failure does not establish that the request reached Haven.
+Each record represents an actual HTTP transport attempt and includes its method, fixed endpoint-family label, status or transport-failure marker, elapsed time, imported integration version, and response byte count. Timing excludes waiting for serialization or pacing. The byte count describes the already-read body after any HTTP content decoding; `unavailable` means no response was returned. These records omit credentials, tokens, headers, body contents, target IDs, and query values. A locally rejected cooldown call produces no HTTP-attempt record. A transport failure does not establish that the request reached Haven.
+
+After updating and restarting Home Assistant, enable debug logging and look for `version=1.0.12` in a new HTTP-attempt record. This value comes from the imported client code, rather than rereading the downloaded manifest during each request. A successful command with `response_bytes=0` has an empty acknowledgment; a parsing error with a nonzero count needs further investigation without assuming that the body was empty.
 
 The API defaults are centralized in [`havenlighting/config.py`](custom_components/haven/havenlighting/config.py). Both remain on the inherited `https://stg-api.havenlighting.com/api` host. The client reuses a Requests session with a **five-second connection timeout** and **thirty-second read-inactivity timeout**; these are not a total wall-clock deadline. The cooldown storage file contains a hashed account key and budget metadata, without passwords or access tokens. Account credentials are managed separately by the Home Assistant configuration entry.
 
@@ -134,9 +136,9 @@ For an unresolved problem, [open an issue](https://github.com/pinskig/hass-haven
 
 ## AI-assisted development since the fork
 
-Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.11, including earlier approaches that later releases replaced.
+Geoffrey Pinski's work on this fork has used **ChatGPT and Codex** for code analysis, implementation, review, regression tests, and documentation. The merged early pull requests link to their Codex tasks. This section records the full merged post-fork history through 1.0.12, including earlier approaches that later releases replaced.
 
-The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, effect commands, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.11 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
+The upstream **1.0.5** baseline already supplied zone/group controls, brightness and color mappings, effect commands, token renewal, HACS installation, the 2025 API rewrite, staging endpoints, and session device-ID generation. Those are credited to the original and Redux projects. Part 3's changes are detailed below. Dates use **America/New_York** time; versions 1.0.6–1.0.12 all landed on October 31 locally, although GitHub's UTC dates cross into November 1.
 
 ### April 19, 2026 — Initial polling and rate-limit work
 
@@ -223,20 +225,28 @@ Reorganized the README around features, compatibility, HACS installation, config
 
 ### October 31, 2026 — Version 1.0.11
 
+[Commit 76c68b7](https://github.com/pinskig/hass-haven-lighting-part3/commit/76c68b79562124b9f734df6da64bef693e2d3e48)
+
 - Updated device-registry iteration for newer Home Assistant versions, removing the mapping deprecation warning while retaining compatibility with the older registry API.
 - Preserved the global check for devices owned by another configuration entry. Added real Home Assistant regressions for conflicting controller and zone identities, including preservation of the existing owner's custom name and area.
 - Kept pending reconciliation and ordinary polling timers when a failed command leaves the cached state unchanged. Previously, republishing the unchanged snapshot canceled a pending command refresh and restarted the polling interval, which could leave the displayed state stale during repeated failures. Confirmed partial successes are still published.
 - Added real Home Assistant regressions for a successful command followed by a malformed command reply, and for preserving provider cooldowns when that scheduled refresh runs. The fix does not replay commands or create an additional refresh timer.
 
+### October 31, 2026 — Version 1.0.12
+
+- Extended refresh preservation to partially successful command batches. A confirmed brightness change followed by a failed color reply is published without canceling an already scheduled refresh or resetting the polling interval.
+- Added the imported integration version and response byte count to each HTTP-attempt DEBUG record. Debugging enabled after startup can now distinguish running code from downloaded files and empty replies from nonempty replies, without recording response contents.
+- Added a real Home Assistant regression for the partially successful brightness/color sequence, plus a consistency check between the imported version marker and the integration manifest.
+
 ## Development tests
 
-Version **1.0.11** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
+Version **1.0.12** was verified locally in all three environments below. [GitHub Actions](https://github.com/pinskig/hass-haven-lighting-part3/actions/workflows/tests.yml) runs the same matrix on pushes and pull requests:
 
 | Suite | Environment | Result |
 | --- | --- | --- |
-| Client and adapter regressions | Python 3.12 | 104 passed |
-| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 41 passed |
-| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 41 passed |
+| Client and adapter regressions | Python 3.12 | 106 passed |
+| Home Assistant integration | HA 2024.1.0 / Python 3.11 | 42 passed |
+| Home Assistant integration | HA 2026.10.4 / Python 3.14 | 42 passed |
 
 These are controlled offline checks. They exercise actual Home Assistant behavior against fake Haven responses; they do not certify live-provider quotas or physical-light behavior. The declared Home Assistant minimum is 2024.1.0; the framework matrix tests the two exact releases above.
 
@@ -249,7 +259,7 @@ python -m pip install -r tests/requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-No Haven credentials are needed. Tests cover transport behavior, request concurrency, malformed responses, immutable state, command batching, and registry policy. Adapter and registry contract tests use explicitly labeled doubles.
+No Haven credentials are needed. Tests cover transport behavior, request concurrency, malformed responses, immutable state, command batching, and registry policy. Adapter and registry contract tests use explicitly labeled doubles. Release changes must keep `havenlighting/version.py` and `manifest.json` in sync; the transport tests check this agreement.
 
 ### Real Home Assistant tests
 

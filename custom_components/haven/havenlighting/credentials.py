@@ -15,6 +15,7 @@ import requests
 from .config import ApiConfig
 from .exceptions import AuthenticationError, ApiError
 from .request_gate import RequestGate
+from .version import INTEGRATION_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -314,11 +315,14 @@ class Credentials:
                     if log_method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
                         log_method = "OTHER"
                     logger.debug(
-                        "Haven HTTP attempt: method=%s endpoint=%s status=%s elapsed=%.3fs",
+                        "Haven HTTP attempt: method=%s endpoint=%s status=%s elapsed=%.3fs "
+                        "version=%s response_bytes=%s",
                         log_method,
                         _request_endpoint_family(path),
                         response.status_code if response is not None else "request_failed",
                         time.monotonic() - started,
+                        INTEGRATION_VERSION,
+                        len(response.content) if response is not None else "unavailable",
                     )
                 status = response.status_code
                 retry_after = self._parse_retry_after(response.headers.get("Retry-After"))

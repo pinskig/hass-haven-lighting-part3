@@ -485,6 +485,59 @@ async def test_malformed_command_reply_stops_batch_without_confirmation_or_repla
     assert coordinator.data[key].is_on is False
 
 
+async def test_partial_command_failure_keeps_pending_refresh(
+    hass, real_loaded_entry, haven_api, budget_transport, monkeypatch
+):
+    """Publishing confirmed brightness must preserve color reconciliation."""
+    from custom_components.haven.const import COMMAND_REFRESH_DELAY
+
+    coordinator = hass.data["haven"][real_loaded_entry.entry.entry_id]["coordinators"][0]
+    entity_id = entity_for(hass)
+    before = len(budget_transport.calls)
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id}, blocking=True
+    )
+    previous = coordinator.data
+    key = next(key for key in previous if key.kind == "Zone" and key.remote_id == 101)
+    request = requests.sessions.Session.request
+
+    def malformed_color_reply(session, method, url, **kwargs):
+        response = request(session, method, url, **kwargs)
+        if urlsplit(url).path.endswith("/Commands/SetColor"):
+            response._content = b'{"truncated":'
+        return response
+
+    monkeypatch.setattr(requests.sessions.Session, "request", malformed_color_reply)
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            "light", "turn_on",
+            {"entity_id": entity_id, "brightness": 204, "rgb_color": (0, 0, 255)},
+            blocking=True,
+        )
+    await async_drain_scheduled_work(hass)
+    # Brightness succeeded and must still reach entities despite the later error.
+    assert coordinator.data != previous
+    assert coordinator.data[key].brightness == 204
+    assert coordinator.data[key].color_id == previous[key].color_id
+    assert hass.states.get(entity_id).attributes["brightness"] == 204
+    assert haven_api.zones[0]["colorId"] == 25
+    assert len(budget_transport.calls) == before + 3
+
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=COMMAND_REFRESH_DELAY + 1)
+    )
+    await async_drain_scheduled_work(hass)
+    assert [(method, path) for _session, method, path in budget_transport.calls[before:]] == [
+        ("POST", "/Commands/On"),
+        ("POST", "/Commands/Brightness"), ("POST", "/Commands/SetColor"),
+        ("GET", f"/LightAndZones/OrderedList/{LOCATION_ID}"),
+        ("GET", f"/Group/AllGroupsByLocation/{LOCATION_ID}"),
+    ]
+    assert hass.states.get(entity_id).state == "on"
+    assert hass.states.get(entity_id).attributes["brightness"] == 204
+    assert hass.states.get(entity_id).attributes["rgb_color"] == (0, 0, 255)
+
+
 async def test_unchanged_command_failure_keeps_pending_refresh(
     hass, real_loaded_entry, haven_api, budget_transport
 ):

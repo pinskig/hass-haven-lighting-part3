@@ -108,10 +108,11 @@ class HavenCoordinator(DataUpdateCoordinator[dict[TargetKey, LightState]]):
                 # while surfacing the failure; no automatic command retry.
                 data = self.location.snapshot
                 self._last_refresh_data = data
-                # Publishing unchanged data would cancel a pending refresh and
-                # postpone the normal poll without a confirmed state change.
+                # Publish confirmed partial changes without canceling a pending
+                # reconciliation or postponing the normal poll after a failure.
                 if self.last_update_success and data != self.data:
-                    self.async_set_updated_data(data)
+                    self.data = data
+                    self.async_update_listeners()
                 accounts = await async_get_account_store(self.hass)
                 await accounts.async_flush()
                 raise HomeAssistantError(str(error)) from error

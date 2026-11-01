@@ -560,15 +560,55 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(self.sent[1][3] - self.sent[0][3], 1)
         self.assertEqual([record.getMessage() for record in captured.records], [
-            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.250s",
-            "Haven HTTP attempt: method=GET endpoint=/Group/AllGroupsByLocation status=200 elapsed=0.250s",
+            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.250s "
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2",
+            "Haven HTTP attempt: method=GET endpoint=/Group/AllGroupsByLocation status=200 elapsed=0.250s "
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2",
         ])
+
+    def test_debug_identifies_loaded_version_and_response_body_size(self):
+        credentials = self.credentials(RequestGate(min_request_interval=0))
+        light = self.light(credentials)
+        for body in (b"", b"{}", b"<html>PRIVATE_RESPONSE</html>", b" \r\n"):
+            with self.subTest(body=body):
+                self.replies.append((200, body, {}))
+                before = len(self.sent)
+                # Logs must identify the imported handler, even if the manifest
+                # on disk changes after startup or DEBUG is enabled later.
+                with patch.object(credentials_module, "INTEGRATION_VERSION",
+                                  "offline-loaded-build", create=True), \
+                        self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
+                    if body in (b"", b"{}"):
+                        light.set_color(25)
+                    else:
+                        with self.assertRaises(ApiError):
+                            light.set_color(25)
+                self.assertEqual(len(self.sent), before + 1)
+                self.assertEqual(len(captured.records), 1)
+                diagnostic = captured.records[0].getMessage()
+                self.assertIn("version=offline-loaded-build", diagnostic)
+                self.assertIn(f"response_bytes={len(body)}", diagnostic)
+                self.assertNotIn("PRIVATE_RESPONSE", diagnostic)
+
+    def test_loaded_diagnostic_version_matches_integration_manifest(self):
+        from havenlighting.version import INTEGRATION_VERSION
+
+        manifest_path = (
+            Path(__file__).resolve().parents[1]
+            / "custom_components" / "haven" / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(INTEGRATION_VERSION, manifest["version"])
+        self.assertEqual(credentials_module.INTEGRATION_VERSION, INTEGRATION_VERSION)
 
     def test_debug_counts_401_refresh_and_retry_as_three_attempts(self):
         credentials = self.credentials(RequestGate(min_request_interval=0))
+        refresh_data = {
+            "token": "replacement-token", "refreshToken": "replacement-refresh", "id": 123,
+        }
         self.replies.extend([
             (401, {}, {}),
-            (200, {"token": "replacement-token", "refreshToken": "replacement-refresh", "id": 123}, {}),
+            (200, refresh_data, {}),
             (200, {}, {}),
         ])
         with self.assertLogs(credentials_module.logger, level="DEBUG") as captured:
@@ -576,9 +616,12 @@ class TransportTests(unittest.TestCase):
 
         self.assertEqual(len(self.sent), 3)
         self.assertEqual([record.getMessage() for record in captured.records], [
-            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=401 elapsed=0.000s",
-            "Haven HTTP attempt: method=POST endpoint=/Auth/Refresh status=200 elapsed=0.000s",
-            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.000s",
+            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=401 elapsed=0.000s "
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2",
+            "Haven HTTP attempt: method=POST endpoint=/Auth/Refresh status=200 elapsed=0.000s "
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes={len(json.dumps(refresh_data).encode())}",
+            "Haven HTTP attempt: method=GET endpoint=/LightAndZones/OrderedList status=200 elapsed=0.000s "
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=2",
         ])
         for secret in ("audit-token", "audit-refresh", "replacement-token", "replacement-refresh", "987654"):
             self.assertNotIn(secret, "\n".join(captured.output))
@@ -598,7 +641,8 @@ class TransportTests(unittest.TestCase):
 
         self.assertEqual(len(self.sent), 1)
         self.assertEqual([record.getMessage() for record in captured.records], [
-            "Haven HTTP attempt: method=POST endpoint=/Commands/Off status=request_failed elapsed=0.500s",
+            "Haven HTTP attempt: method=POST endpoint=/Commands/Off status=request_failed elapsed=0.500s "
+            f"version={credentials_module.INTEGRATION_VERSION} response_bytes=unavailable",
         ])
         self.assertNotIn("PRIVATE_EXCEPTION_DETAIL", "\n".join(captured.output))
 

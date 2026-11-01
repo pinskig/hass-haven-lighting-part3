@@ -155,12 +155,14 @@ class DataUpdateCoordinator:
 
     def async_set_updated_data(self, data):
         """Expose listener calls; actual HA behavior has separate contract tests."""
-        changed = self.always_update or not self.last_update_success or self.data != data
         self.data = data
         self.last_update_success = True
-        if changed:
-            for listener in self._listeners:
-                listener()
+        self.async_update_listeners()
+
+    def async_update_listeners(self):
+        """Manual publication notifies listeners even when data is unchanged."""
+        for listener in self._listeners:
+            listener()
 
 
 class CoordinatorEntity:
